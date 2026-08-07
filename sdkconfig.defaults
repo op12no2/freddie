@@ -1,0 +1,10 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# Board has 8 MB flash (default header assumes 2 MB)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# ESP32-S3 with 8 MB embedded (octal) PSRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+# Don't abort boot if PSRAM init fails; just report none
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
