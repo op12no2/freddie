@@ -15,13 +15,18 @@
 #include "driver/rmt_encoder.h"
 #include "driver/rmt_tx.h"
 #include "driver/uart.h"
+#include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_netif.h"
+#include "esp_now.h"
 #include "esp_random.h"
 #include "esp_rom_sys.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
 
 #define AMG_SDA_GPIO    8
 #define AMG_SCL_GPIO    9
@@ -1549,6 +1554,161 @@ static void watch_step(const int16_t px[64], const float dps[3],
     }
 }
 
+/* Beacon: a small ESP-NOW frame, broadcast every BEACON_MS, that says
+ * "this is Freddie, still up". No association, no AP, no IP stack — an
+ * unencrypted 802.11 frame to the broadcast address on one fixed
+ * channel, which anything else listening on that channel hears. The
+ * radio, not the packet, is what costs: an unassociated station sits in
+ * receive at roughly 80 mA whether it sends ten frames a second or one,
+ * so `n` takes WiFi down outright rather than just muting the sends. */
+#define BEACON_CHANNEL 1        /* the other end has to listen on this one */
+#define BEACON_MS      100      /* 10 Hz; the frame itself is tens of us of
+                                   air time, so the rate is nearly free */
+#define BEACON_ID      "freddie"
+#define BEACON_VER     1
+#define BEACON_TX_QDBM 44       /* 11 dBm, in quarter-dB steps: a room's
+                                   worth of range, and a smaller gulp out
+                                   of a pack that's also running two motors
+                                   than the 20 dBm default asks for */
+
+/* Wire format: 21 bytes, little-endian, packed. Later versions may
+ * append fields under a new ver; the ones here never move. */
+typedef struct __attribute__((packed)) {
+    char     magic[4];   /* "FRED", not NUL-terminated */
+    uint8_t  ver;        /* BEACON_VER */
+    char     id[8];      /* BEACON_ID, NUL-padded */
+    uint32_t seq;        /* from 0 at boot; gaps are frames that were lost */
+    uint32_t up_ms;      /* uptime, so a reboot reads as one */
+} beacon_t;
+
+static const uint8_t beacon_bcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+static bool beacon_ok;              /* WiFi came up; the task is running */
+static volatile bool beacon_want = true;   /* the console asks... */
+static bool beacon_up;                     /* ...the task obeys, and owns
+                                              the radio: no locking needed */
+static uint32_t beacon_seq;
+
+static bool beacon_fail(const char *what, esp_err_t err)
+{
+    printf("beacon: %s failed (%s)\n", what, esp_err_to_name(err));
+    return false;
+}
+
+/* Channel, power and peer are all properties of a running radio, so
+ * they're re-stated on every start, not just the first. */
+static bool beacon_radio_start(void)
+{
+    esp_err_t err = esp_wifi_start();
+    if (err != ESP_OK) {
+        return beacon_fail("wifi start", err);
+    }
+    err = esp_wifi_set_channel(BEACON_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) {
+        return beacon_fail("set channel", err);
+    }
+    esp_wifi_set_max_tx_power(BEACON_TX_QDBM);
+    err = esp_now_init();
+    if (err != ESP_OK) {
+        return beacon_fail("esp-now init", err);
+    }
+    esp_now_peer_info_t peer = {
+        .channel = BEACON_CHANNEL,
+        .ifidx = WIFI_IF_STA,
+        .encrypt = false,
+    };
+    memcpy(peer.peer_addr, beacon_bcast, sizeof(peer.peer_addr));
+    err = esp_now_add_peer(&peer);
+    if (err != ESP_OK) {
+        return beacon_fail("add peer", err);
+    }
+    return true;
+}
+
+static void beacon_radio_stop(void)
+{
+    esp_now_deinit();
+    esp_wifi_stop();
+}
+
+static void beacon_task(void *arg)
+{
+    TickType_t wake = xTaskGetTickCount();
+    while (1) {
+        xTaskDelayUntil(&wake, pdMS_TO_TICKS(BEACON_MS));
+        if (beacon_want != beacon_up) {
+            if (beacon_want) {
+                beacon_up = beacon_radio_start();
+                beacon_want = beacon_up;   /* don't retry a failing start */
+                if (beacon_up) {
+                    printf("beacon: on\n");
+                }
+            } else {
+                beacon_radio_stop();
+                beacon_up = false;
+                printf("beacon: off, radio down\n");
+            }
+        }
+        if (!beacon_up) {
+            continue;
+        }
+        beacon_t b = {
+            .magic = { 'F', 'R', 'E', 'D' },
+            .ver = BEACON_VER,
+            .id = BEACON_ID,
+            .seq = beacon_seq++,
+            .up_ms = esp_timer_get_time() / 1000,
+        };
+        /* Fire and forget. A frame that doesn't make it shows up at the
+         * other end as a gap in seq, which is all anyone can do about it
+         * on a broadcast nobody acknowledges. */
+        (void)esp_now_send(beacon_bcast, (const uint8_t *)&b, sizeof(b));
+    }
+}
+
+static void beacon_init(void)
+{
+    esp_err_t err = nvs_flash_init();   /* WiFi keeps its PHY calibration here */
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) {
+        beacon_fail("nvs init", err);
+        return;
+    }
+    if ((err = esp_netif_init()) != ESP_OK) {
+        beacon_fail("netif init", err);
+        return;
+    }
+    if ((err = esp_event_loop_create_default()) != ESP_OK) {
+        beacon_fail("event loop", err);
+        return;
+    }
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    if ((err = esp_wifi_init(&cfg)) != ESP_OK) {
+        beacon_fail("wifi init", err);
+        return;
+    }
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);   /* nothing to remember */
+    if ((err = esp_wifi_set_mode(WIFI_MODE_STA)) != ESP_OK) {
+        beacon_fail("wifi mode", err);
+        return;
+    }
+    if (!beacon_radio_start()) {
+        return;
+    }
+    beacon_up = true;
+    beacon_ok = true;
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    printf("beacon: \"%s\" every %d ms on channel %d, from "
+           "%02x:%02x:%02x:%02x:%02x:%02x (n to stop)\n",
+           BEACON_ID, BEACON_MS, BEACON_CHANNEL,
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    xTaskCreate(beacon_task, "beacon", 3072, NULL, 4, NULL);
+}
+
 /* Recorder: 10 Hz snapshots of every sensor plus the commanded motor
  * duties, held state and watcher state, into a PSRAM ring for bench
  * analysis (r to record, d to dump as CSV). PSRAM is wiped by reset —
@@ -1752,6 +1912,8 @@ static void print_help(void)
            "                     s = sprint (5 s fuse — floor, stand clear;\n"
            "                     or: hold upside down 1 s, set down)\n"
            "  l <r> <g> <b>      set the RGB LED, 0..255 (l 32 0 0)\n"
+           "  n                  ESP-NOW beacon on/off (off drops the radio,\n"
+           "                     which is where the current goes)\n"
            "  r                  record all sensors at 10 Hz, start/stop\n"
            "  d                  dump the recording as CSV\n"
            "  ?                  this help\n");
@@ -1865,6 +2027,13 @@ static void handle_line(char *line)
             rec_on = true;
             printf("recording at %d Hz (r to stop)\n", TICK_HZ);
         }
+    } else if (strcmp(line, "n") == 0) {
+        if (!beacon_ok) {
+            printf("beacon: not running\n");
+        } else {
+            beacon_want = !beacon_want;   /* the task acts on it next tick */
+            printf("beacon: %s\n", beacon_want ? "starting" : "stopping");
+        }
     } else if (strcmp(line, "d") == 0) {
         rec_dump();
     } else if (strcmp(line, "w") == 0) {
@@ -1889,6 +2058,7 @@ void app_main(void)
     ina_init();
     lsm_init();
     tick_init();
+    beacon_init();
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0));
     print_help();
 
