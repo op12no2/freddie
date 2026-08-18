@@ -697,9 +697,9 @@ static void held_check(const float dps[3], const float g[3])
 #define COAX_HOPS_MAX    3     /* he comes partway; they meet him in the
                                   middle */
 #define COAX_HOP_PCT     30
-#define COAX_HOP_MS      600   /* one tentative hop, shrinking as the blob
+#define COAX_HOP_MS      1200  /* one tentative hop, shrinking as the blob
                                   grows so he creeps as he nears */
-#define COAX_HOP_MIN_MS  250
+#define COAX_HOP_MIN_MS  500
 #define COAX_TURN_PCT    20
 #define COAX_TURN_MIN_DEG 6.0f /* under a pixel column — not worth turning */
 #define COAX_TURN_TIMEOUT_S 5
@@ -901,11 +901,16 @@ static void perform_sprint(void)
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
+    /* distance varies hop to hop: anywhere from the usual leg out to
+     * twice that, so the sprint doesn't always cover the same ground */
+    float dist_mult = 1.0f + (esp_random() % 1001) / 1000.0f;   /* [1.0, 2.0] */
+    int run_ms = (int)(SPRINT_RUN_MS * dist_mult);
+    int back_ms = (int)(SPRINT_BACK_MS * dist_mult);
     rgb_set(RGB_BLUE);
     float peak = 0;
-    ok = ok && sprint_leg(SPRINT_RUN_MS);
+    ok = ok && sprint_leg(run_ms);
     ok = ok && sprint_spin(&peak);
-    ok = ok && sprint_leg(SPRINT_BACK_MS);
+    ok = ok && sprint_leg(back_ms);
     drive(0, 0);
     watch_bg_seed = true;   /* wherever he ended up, the eye moved */
     led_nominal();
@@ -914,10 +919,10 @@ static void perform_sprint(void)
         return;
     }
     if (sprint_vmin < 90.0f) {
-        wsay("sprint: peak spin %.0f dps, pack dipped to %.2f V\n",
-               peak, sprint_vmin);
+        wsay("sprint: peak spin %.0f dps, pack dipped to %.2f V (x%.2f)\n",
+               peak, sprint_vmin, dist_mult);
     } else {
-        wsay("sprint: peak spin %.0f dps\n", peak);
+        wsay("sprint: peak spin %.0f dps (x%.2f)\n", peak, dist_mult);
     }
     if (watch_state == WATCH_REST) {
         /* the breather: that genuinely cost him — the next look waits */
