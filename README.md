@@ -1,8 +1,6 @@
 # Freddie
 
-A little autonomous robot.
-
-Freddie mostly sits still with the motors powered down, looking at the room through an 8x8 thermal camera. Every few minutes he has a look around - a slow full spin, lingering wherever it's warm, facing the most interesting thing he saw. A new source of warmth (someone arriving) gets a flash of amber and sometimes a little hello wiggle, though not always; a greeting is never a certainty and it gets rarer as he tires. If the warmth remains for a few seconds and moves like a person rather than a radiator, he may work up the nerve to come and meet you, in short careful hops, creeping as he gets close and stopping if you back away. He never chases. He lives an asleep/awake rhythm that an eventful day stretches and a quiet one cuts short, he knows when he's been picked up and two quick lifts toggles wake/sleep. He's completely silent: everything he has to say, he says with light and movement. Well apart form the motors, which are pretty loud.
+A shy little autonomous robot.
 
 ## Parts
 

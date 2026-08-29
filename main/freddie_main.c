@@ -1,11 +1,9 @@
 /* firmware: Freddie the robot. AMG8833 thermal camera, LSM6DSOX IMU and
- * INA219 power monitor on one I2C bus, DRV8833 motors, the DevKit's
- * onboard RGB status LED, and a serial test console (type '?' in
- * idf.py monitor). */
+ * INA219 power monitor on one I2C bus, DRV8833 motors, and the DevKit's
+ * onboard RGB status LED. Fully autonomous: the LEDs and the gestures
+ * (pick up, flip, double lift-down) are his whole interface. */
 
 #include <math.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,19 +12,12 @@
 #include "driver/ledc.h"
 #include "driver/rmt_encoder.h"
 #include "driver/rmt_tx.h"
-#include "driver/uart.h"
-#include "esp_event.h"
-#include "esp_heap_caps.h"
-#include "esp_netif.h"
-#include "esp_now.h"
 #include "esp_random.h"
 #include "esp_rom_sys.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "nvs_flash.h"
 
 #define AMG_SDA_GPIO    8
 #define AMG_SCL_GPIO    9
@@ -131,12 +122,12 @@ static void amg_init(void)
 {
     amg = i2c_add(AMG_I2C_ADDR);
 
-    /* Non-fatal: a missing sensor must not stop motor testing. */
+    /* Non-fatal: a missing sensor leaves its _ok flag false and the
+     * boot LED red. */
     if (amg_write_reg(AMG_REG_PCTL, 0x00) != ESP_OK ||
         amg_write_reg(AMG_REG_RST, 0x3F) != ESP_OK ||
         amg_write_reg(AMG_REG_INTC, 0x00) != ESP_OK ||
         amg_write_reg(AMG_REG_FPSC, 0x00) != ESP_OK) {
-        printf("AMG8833 not responding; thermal readings disabled\n");
         amg_ok = false;
         return;
     }
@@ -179,7 +170,6 @@ static void ina_init(void)
     ina = i2c_add(INA_I2C_ADDR);
     uint8_t cfg[3] = { INA_REG_CONFIG, 0x39, 0x9F };
     if (i2c_master_transmit(ina, cfg, sizeof(cfg), 100) != ESP_OK) {
-        printf("INA219 not responding; power readings disabled\n");
         return;
     }
     ina_ok = true;
@@ -211,7 +201,6 @@ static void lsm_init(void)
         id != 0x6C ||
         i2c_master_transmit(lsm, xl_cfg, sizeof(xl_cfg), 100) != ESP_OK ||
         i2c_master_transmit(lsm, g_cfg, sizeof(g_cfg), 100) != ESP_OK) {
-        printf("LSM6DSOX not responding; motion readings disabled\n");
         return;
     }
     lsm_ok = true;
@@ -272,44 +261,6 @@ static void rgb_set(uint8_t r, uint8_t g, uint8_t b)
     ESP_ERROR_CHECK(rmt_transmit(rgb_chan, rgb_enc, grb, sizeof(grb), &tx_cfg));
     ESP_ERROR_CHECK(rmt_tx_wait_all_done(rgb_chan, 100));
     esp_rom_delay_us(60);   /* latch gap so a back-to-back frame isn't swallowed */
-}
-
-/* Narration ("watch: almost went") prints to the console as ever, and
- * while recording it also lands in a timestamped note ring that `d`
- * interleaves into the CSV as `# <ms> <text>` comment lines — the
- * story rides with the numbers, and the bench's
- * pandas.read_csv(comment="#") never sees it. Console-only chatter
- * (help, readings, cal) stays plain printf. */
-#define NOTE_N   256
-#define NOTE_LEN 80
-
-typedef struct { uint32_t ms; char text[NOTE_LEN]; } note_t;
-
-static note_t note_buf[NOTE_N];
-static int note_head, note_len;
-static volatile bool rec_on;
-
-static void wsay(const char *fmt, ...)
-{
-    char text[NOTE_LEN];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(text, sizeof(text), fmt, ap);
-    va_end(ap);
-    fputs(text, stdout);
-    if (rec_on) {
-        size_t len = strlen(text);
-        if (len > 0 && text[len - 1] == '\n') {
-            text[len - 1] = '\0';
-        }
-        note_t *n = &note_buf[note_head];
-        n->ms = esp_timer_get_time() / 1000;
-        memcpy(n->text, text, sizeof(n->text));
-        note_head = (note_head + 1) % NOTE_N;
-        if (note_len < NOTE_N) {
-            note_len++;
-        }
-    }
 }
 
 static void pwm_channel_init(ledc_channel_t ch, int gpio)
@@ -376,13 +327,15 @@ static bool pack_live(void)
 
 /* No two TT motors are matched: the trim is added to the left duty
  * (sign-aware, so it corrects magnitude in reverse too) whenever both
- * wheels are driven. Set by open-loop console test, not by fitting hunt
+ * wheels are driven. Set by open-loop test, not by fitting hunt
  * logs — those commands come from steering feedback and the fit's
  * intercept is biased (it once said -6, which itself caused a left
  * veer). Measured: actual duties 49/50 drive straight. */
 #define DRIVE_TRIM_PCT  -1
 
-static int16_t cmd_left, cmd_right;   /* commanded duties pre-trim, for the log */
+static int16_t cmd_left, cmd_right;   /* commanded duties pre-trim, so the
+                                         hold detector can tell idle from
+                                         driving */
 
 static void drive(int left_pct, int right_pct)
 {
@@ -392,9 +345,7 @@ static void drive(int left_pct, int right_pct)
         left_pct += (left_pct > 0) ? DRIVE_TRIM_PCT : -DRIVE_TRIM_PCT;
     }
     if (!pack_live()) {
-        printf("motors (traced, usb power only): left %d right %d\n",
-               left_pct, right_pct);
-        return;
+        return;   /* USB power only: never pull motor amps through the diode */
     }
     /* The DRV8833 sleeps whenever f1 is still — which for the watcher
      * is nearly always. Wake time is well under a PWM period. */
@@ -472,17 +423,6 @@ static void perform_found(void)
     led_nominal();
 }
 
-/* One blue wink per second — the fuse for delayed starts. */
-static void countdown_winks(int secs)
-{
-    for (int i = 0; i < secs; i++) {
-        rgb_set(RGB_BLUE);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        rgb_set(0, 0, 0);
-        vTaskDelay(pdMS_TO_TICKS(800));
-    }
-}
-
 static void motors_init(void)
 {
     ledc_timer_config_t timer_cfg = {
@@ -512,7 +452,7 @@ static void motors_init(void)
 /* Pickup detection: handling is unmistakable to the gyro — 150 dps
  * against a sub-1 dps floor when he's parked (wall-run log). Watched
  * only while the motors are idle, which for the watcher is nearly
- * always. Violet LED while held; logged in the `held` column. */
+ * always. Violet LED while held. */
 #define HELD_DPS      20.0f   /* sustained rotation while idle = in hands */
 #define HELD_DRIVE_AZ 0.90f   /* sustained tilt (~25 deg) while driving =
                                  lifted; the habitat's floors are flat */
@@ -521,7 +461,7 @@ static void motors_init(void)
 #define HELD_OFF_MS   1000    /* this long quiet again = set down */
 
 /* Gesture command, Foundation-style: two brief lift-downs in quick
- * succession toggle the watcher, for when the console is long gone. */
+ * succession toggle the watcher — the only switch he has. */
 #define GEST_LIFT_MAX_S 4     /* each lift-down this brief (incl. quiet 1 s) */
 #define GEST_GAP_MAX_S  3     /* and the next lift this soon after set-down */
 
@@ -567,13 +507,11 @@ static void held_check(const float dps[3], const float g[3])
             sprint_armed = false;   /* each hold is a fresh ritual */
             drive(0, 0);   /* wheels stop, and the driver sleeps, in hands */
             rgb_set(RGB_HELD);   /* violet: airborne */
-            wsay("picked up!\n");
         }
     } else if (g[2] < FLIP_AZ) {
         if (++flip_ticks >= FLIP_TICKS && !sprint_armed) {
             sprint_armed = true;
             rgb_set(RGB_BLUE);   /* blue in hand: armed */
-            wsay("sprint: armed — set down to run\n");
         }
         held_quiet_since = 0;   /* inverted stillness is not a set-down */
     } else if (gmag < HELD_QUIET_DPS && g[2] > HELD_DRIVE_AZ) {
@@ -585,7 +523,6 @@ static void held_check(const float dps[3], const float g[3])
             held = false;
             held_ticks = 0;
             led_nominal();
-            wsay("set down\n");
             if (sprint_armed) {
                 sprint_armed = false;
                 gest_count = 0;        /* the flip spends this lift-down */
@@ -606,16 +543,16 @@ static void held_check(const float dps[3], const float g[3])
     }
 }
 
-/* Watcher: the resting heartbeat (w to toggle). Rest with the driver
- * asleep, learning a per-pixel background; look around (a gyro-metered
- * full circle) at log-normally random intervals whose median stretches
- * as the pack tires; a glimpse of warmth earns a beat of amber and a
- * hello wiggle and pulls the next look closer (a set-down pulls it
- * too); the sweep itself slows when something warm crosses the view —
- * the gaze lingers — and ends by turning back, shortest way round, to
- * the warmest heading it saw, or to the glimpse's angle if the sweep
- * found nothing, or nowhere at all if there was neither. All knobs
- * below; thresholds cite f1/log/. */
+/* Watcher: the resting heartbeat. Rest with the driver asleep, learning
+ * a per-pixel background; look around (a gyro-metered full circle) at
+ * log-normally random intervals whose median stretches as the pack
+ * tires; a glimpse of warmth earns a beat of amber and a hello wiggle
+ * and pulls the next look closer (a set-down pulls it too); the sweep
+ * itself slows when something warm crosses the view — the gaze lingers
+ * — and ends by turning back, shortest way round, to the warmest
+ * heading it saw, or to the glimpse's angle if the sweep found nothing,
+ * or nowhere at all if there was neither. All knobs below; thresholds
+ * cite f1/log/. */
 #define WATCH_LOOK_MED_S    180     /* median rest between looks, fresh pack */
 #define WATCH_LOOK_SIGMA    0.7f    /* log-normal spread: double-takes and naps */
 #define WATCH_LOOK_MIN_S    30
@@ -780,17 +717,13 @@ static void led_nominal(void)
 }
 
 /* The sprint — "how fast can he go?", George's question answered with
- * theatre. Five countdown winks to aim him and stand clear (the fuse
- * idiom, here with a safety poll under it), a full-duty second out, a
- * fast gyro-metered about-face, and a second home, easing off the
- * throttle over each leg's tail so he pulls up rather than skids.
- * Armed by `p s` or the flip gesture. Floor doctrine like the c runs:
- * the fuse cannot know he's on a table. Aborts on handling, tilt, or
- * unexpected rotation (which a full-speed wall hit becomes). Prints
- * its own telemetry — peak spin rate, and the launch's minimum volts:
- * full duty from rest is the hardest yank the pack ever gets, so the
- * sprint doubles as the pack's stress test (suspect it in any reset
- * near 5.2 V). */
+ * theatre. Five countdown winks to aim him and stand clear (a safety
+ * poll under each), a full-duty second out, a fast gyro-metered
+ * about-face, and a second home, easing off the throttle over each
+ * leg's tail so he pulls up rather than skids. Armed by the flip
+ * gesture. Floor doctrine: the fuse cannot know he's on a table.
+ * Aborts on handling, tilt, or unexpected rotation (which a
+ * full-speed wall hit becomes). */
 #define SPRINT_FUSE_S    5
 #define SPRINT_RUN_PCT   100
 #define SPRINT_RUN_MS    2300
@@ -809,16 +742,15 @@ static void led_nominal(void)
                                     spikes across the tilt line, a lift
                                     stays across it */
 
-static float sprint_vmin;
 static int sprint_bad;
 
 /* One safety poll: handling, tilt, unexpected yaw (max_dps 0 =
- * spinning on purpose, don't judge), and the running pack-volts
- * minimum. Tilt/yaw must persist bad_ticks consecutive polls —
- * 1 while stationary (the fuse), SPRINT_BAD_TICKS while moving. */
+ * spinning on purpose, don't judge). Tilt/yaw must persist bad_ticks
+ * consecutive polls — 1 while stationary (the fuse), SPRINT_BAD_TICKS
+ * while moving. */
 static bool sprint_safe(float max_dps, int bad_ticks, float *gz)
 {
-    float dps[3], g[3], v, ma;
+    float dps[3], g[3];
     if (held) {
         return false;
     }
@@ -830,9 +762,6 @@ static bool sprint_safe(float max_dps, int bad_ticks, float *gz)
     sprint_bad = bad ? sprint_bad + 1 : 0;
     if (gz) {
         *gz = dps[2];
-    }
-    if (ina_ok && ina_read(&v, &ma) == ESP_OK && v > 3.0f && v < sprint_vmin) {
-        sprint_vmin = v;
     }
     return sprint_bad < bad_ticks;
 }
@@ -855,7 +784,7 @@ static bool sprint_leg(int ms)
     return true;
 }
 
-static bool sprint_spin(float *peak)
+static bool sprint_spin(void)
 {
     float yaw = 0, gz;
     int64_t t0 = esp_timer_get_time(), last = t0;
@@ -868,9 +797,6 @@ static bool sprint_spin(float *peak)
         int64_t now = esp_timer_get_time();
         yaw += gz * (float)(now - last) / 1000000.0f;
         last = now;
-        if (fabsf(gz) > *peak) {
-            *peak = fabsf(gz);
-        }
         if (now - t0 > SPRINT_SPIN_TIMEOUT_MS * 1000LL) {
             break;   /* gyro trouble: don't pirouette forever */
         }
@@ -881,8 +807,7 @@ static bool sprint_spin(float *peak)
 static void perform_sprint(void)
 {
     if (!lsm_ok) {
-        printf("no IMU, no sprint\n");
-        return;
+        return;   /* no IMU, no sprint */
     }
     if (watch_state == WATCH_REST) {
         /* no look mid-sprint */
@@ -891,7 +816,6 @@ static void perform_sprint(void)
             watch_deadline = busy;
         }
     }
-    sprint_vmin = 99.0f;
     sprint_bad = 0;
     bool ok = true;
     for (int i = 0; ok && i < SPRINT_FUSE_S; i++) {
@@ -912,29 +836,17 @@ static void perform_sprint(void)
     int run_ms = (int)(SPRINT_RUN_MS * dist_mult);
     int back_ms = (int)(SPRINT_BACK_MS * dist_mult);
     rgb_set(RGB_BLUE);
-    float peak = 0;
     ok = ok && sprint_leg(run_ms);
-    ok = ok && sprint_spin(&peak);
+    ok = ok && sprint_spin();
     ok = ok && sprint_leg(back_ms);
     drive(0, 0);
     watch_bg_seed = true;   /* wherever he ended up, the eye moved */
     led_nominal();
-    if (!ok) {
-        wsay("sprint: aborted\n");
-        return;
-    }
-    if (sprint_vmin < 90.0f) {
-        wsay("sprint: peak spin %.0f dps, pack dipped to %.2f V (x%.2f)\n",
-               peak, sprint_vmin, dist_mult);
-    } else {
-        wsay("sprint: peak spin %.0f dps (x%.2f)\n", peak, dist_mult);
-    }
-    if (watch_state == WATCH_REST) {
+    if (ok && watch_state == WATCH_REST) {
         /* the breather: that genuinely cost him — the next look waits */
         int br = SPRINT_BREATHER_S / 2 +
                  (int)(esp_random() % (SPRINT_BREATHER_S + 1));
         watch_deadline = esp_timer_get_time() + (int64_t)br * 1000000LL;
-        wsay("sprint: catching his breath (~%d s)\n", br);
     }
 }
 
@@ -1004,13 +916,10 @@ static void watch_bedtime_nudge(bool interesting)
     int64_t lo = watch_woke_at + WATCH_AWAKE_MIN_S * 1000000LL;
     int64_t hi = watch_woke_at + WATCH_AWAKE_MAX_S * 1000000LL;
     watch_cycle_at = at < lo ? lo : at > hi ? hi : at;
-    wsay(interesting ? "watch: worth staying up for (+%.1f min)\n"
-                       : "watch: nothing doing (bedtime -%.1f min)\n",
-           fabsf(take) / 60.0f);
 }
 
-/* Shared by the console (w) and the double lift-down gesture. The
- * winks are the acknowledgment: blue-blue = watching, amber = not. */
+/* Shared by the sleep/wake rhythm and the double lift-down gesture. The
+ * winks are the acknowledgment: blue-blue = watching, red = not. */
 static void watch_toggle(void)
 {
     if (watch_state != WATCH_OFF) {
@@ -1024,10 +933,7 @@ static void watch_toggle(void)
         rgb_set(RGB_RED);
         vTaskDelay(pdMS_TO_TICKS(800));
         led_nominal();   /* back to sleep: the ember */
-        wsay("watcher: off (asleep ~%.0f min)\n", span / 60.0f);
-    } else if (!amg_ok) {
-        printf("no thermal camera, no watcher\n");
-    } else {
+    } else if (amg_ok) {   /* no thermal camera, no watcher */
         for (int i = 0; i < 2; i++) {
             rgb_set(RGB_BLUE);
             vTaskDelay(pdMS_TO_TICKS(400));
@@ -1058,11 +964,6 @@ static void watch_toggle(void)
         watch_wind_s = WATCH_WIND_MAX_S / watch_tired();
         watch_doze_s = WATCH_DOZE_MAX_S * watch_tired();
         watch_state = WATCH_REST;
-        wsay("watcher: on (awake ~%.0f min; w or double lift-down "
-               "to stop)\n", span / 60.0f);
-        if (watch_grumpy) {
-            wsay("watch: woken too soon — grumpy until the first look\n");
-        }
         perform_awake();   /* the waking stretch; ends on full green */
     }
 }
@@ -1083,15 +984,12 @@ static void watch_settle(int64_t now)
         drive(-30, 30);
         vTaskDelay(pdMS_TO_TICKS(80));
         drive(0, 0);
-        wsay("watch: huh — could have sworn\n");
     }
     led_nominal();
     watch_bg_seed = true;
     float rest = watch_draw_s();
     watch_deadline = now + (int64_t)(rest * 1000000.0f);
     watch_state = WATCH_REST;
-    wsay("watch: resting %.0f s (mood %.2f, %.2f V)\n",
-           rest, watch_mood(), watch_vrest);
 }
 
 /* The coaxing eye: a blob against the frame mean, not the per-pixel
@@ -1210,7 +1108,6 @@ static void coax_hop_start(int64_t now)
     drive(COAX_HOP_PCT, COAX_HOP_PCT);
     coax_until = now + ms * 1000LL;
     watch_state = WATCH_HOP;
-    wsay("watch: a step closer (%d ms)\n", ms);
 }
 
 /* The look is over: if it ended facing warmth, check the facts before
@@ -1223,7 +1120,6 @@ static void watch_look_done(int64_t now)
         coax_hops = 0;
         coax_window(now, 0, COAX_DWELL_S);
         watch_state = WATCH_DWELL;
-        wsay("watch: something there — checking\n");
         return;
     }
     watch_settle(now);
@@ -1248,7 +1144,6 @@ static void watch_step(const int16_t px[64], const float dps[3],
         watch_glimpse_pending = false;
         watch_hello_done = false;
         watch_deadline = now + watch_soon_us();
-        wsay("watch: new spot, looking soon\n");
     }
 
     float t[64];
@@ -1276,7 +1171,6 @@ static void watch_step(const int16_t px[64], const float dps[3],
             vTaskDelay(pdMS_TO_TICKS(WATCH_GLIMPSE_BEAT_MS));
             led_nominal();
             watch_bg_seed = true;   /* the recoil moved the eye */
-            wsay("watch: flinch — felt that, looking soon\n");
             watch_bedtime_nudge(true);
             int64_t soon = watch_soon_us();
             if (watch_deadline > now + soon) {
@@ -1315,17 +1209,14 @@ static void watch_step(const int16_t px[64], const float dps[3],
             watch_glimpse_sign = off > 0 ? -1 : 1;
             watch_glimpse_deg = fabsf(off) * WATCH_COL_DEG;
             watch_glimpse_pending = true;
-            const char *say = "hello, ";
-            if (watch_hello_done) {
-                say = "";
-            } else if (watch_frand() <
-                       (watch_grumpy ? WATCH_SHRUG_GRUMPY
-                                     : WATCH_SHRUG_FRESH + watch_mood() *
-                                       (WATCH_SHRUG_TIRED - WATCH_SHRUG_FRESH))) {
-                say = "can't be bothered, ";
-                watch_hello_done = true;   /* the shrug spends the hello */
+            if (!watch_hello_done &&
+                watch_frand() <
+                (watch_grumpy ? WATCH_SHRUG_GRUMPY
+                              : WATCH_SHRUG_FRESH + watch_mood() *
+                                (WATCH_SHRUG_TIRED - WATCH_SHRUG_FRESH))) {
+                watch_hello_done = true;   /* can't be bothered: the
+                                              shrug spends the hello */
             }
-            wsay("watch: glimpse (+%.1f C), %slooking soon\n", maxdev, say);
             watch_bedtime_nudge(true);   /* someone appeared */
             rgb_set(RGB_GLIMPSE);
             vTaskDelay(pdMS_TO_TICKS(WATCH_GLIMPSE_BEAT_MS));
@@ -1351,7 +1242,6 @@ static void watch_step(const int16_t px[64], const float dps[3],
             watch_look_until = now + WATCH_TURN_TIMEOUT_S * 1000000LL;
             watch_state = WATCH_LOOK;
             rgb_set(RGB_BLUE);
-            wsay("watch: looking around\n");
         }
         break;
     }
@@ -1413,8 +1303,6 @@ static void watch_step(const int16_t px[64], const float dps[3],
                         now + WATCH_REORIENT_TIMEOUT_S * 1000000LL;
                     drive(d * base, -d * base);
                     watch_state = WATCH_ORIENT;
-                    wsay("watch: turning %.0f deg back to %s\n", delta,
-                           watch_best_drag > 0 ? "the warmth" : "the glimpse");
                     break;
                 }
             }
@@ -1435,7 +1323,7 @@ static void watch_step(const int16_t px[64], const float dps[3],
          * spikes hard but never survives this */
         coax_accumulate(t, mean, now);
         if (coax_full) {
-            wsay("watch: right on top of me — staying put\n");
+            /* right on top of me — staying put */
             watch_settle(now);
             break;
         }
@@ -1448,16 +1336,14 @@ static void watch_step(const int16_t px[64], const float dps[3],
             watch_huh = true;   /* promised, gone: the head-shake */
             watch_settle(now);
         } else if (blob >= COAX_CEIL_PX) {
-            wsay("watch: already close enough\n");
+            /* already close enough */
             watch_settle(now);
         } else if (coax_lively < COAX_LIVELY) {
             /* the hot window ran hotter than the person; only movement
              * tells them apart — warm furniture gets watched, not met */
-            wsay("watch: warm, but nobody home — not going over\n");
             watch_settle(now);
         } else {
-            wsay("watch: a visitor (%.0f px, %.0f%% there) — "
-                   "thinking about it\n", blob, presence * 100);
+            /* a visitor — thinking about it */
             coax_consider(now, presence, blob);
         }
         break;
@@ -1472,11 +1358,10 @@ static void watch_step(const int16_t px[64], const float dps[3],
         }
         if (watch_frand() >= p) {
             if (++coax_nerve >= COAX_NERVE_MAX) {
-                wsay("watch: couldn't work up the nerve\n");
+                /* couldn't work up the nerve */
                 watch_settle(now);
             } else {
-                coax_false_start();
-                wsay("watch: almost went\n");
+                coax_false_start();   /* almost went */
                 coax_until = now + COAX_NERVE_GAP_MS * 1000LL;
             }
             break;
@@ -1517,7 +1402,7 @@ static void watch_step(const int16_t px[64], const float dps[3],
     case WATCH_OBS: {
         coax_accumulate(t, mean, now);
         if (coax_full) {
-            wsay("watch: right on top of me — staying put\n");
+            /* right on top of me — staying put */
             watch_settle(now);
             break;
         }
@@ -1533,16 +1418,15 @@ static void watch_step(const int16_t px[64], const float dps[3],
         } else if (blob >= COAX_CEIL_PX) {
             /* arrived — a polite metre away, and the visitor becomes
              * wallpaper at the settle's reseed, so waving can't yo-yo him */
-            wsay("watch: hi\n");
             perform_found();
             watch_bedtime_nudge(true);   /* a visit that came off: the
                                             day's best event */
             watch_settle(now);
         } else if (blob < coax_prev_px - COAX_RETREAT_PX) {
-            wsay("watch: backing away — won't chase\n");
+            /* backing away — won't chase */
             watch_settle(now);
         } else if (coax_hops >= COAX_HOPS_MAX) {
-            wsay("watch: came this far — your turn\n");
+            /* came this far — your turn */
             watch_settle(now);
         } else {
             coax_consider(now, presence, blob);
@@ -1554,187 +1438,8 @@ static void watch_step(const int16_t px[64], const float dps[3],
     }
 }
 
-/* Beacon: a small ESP-NOW frame, broadcast every BEACON_MS, that says
- * "this is Freddie, still up". No association, no AP, no IP stack — an
- * unencrypted 802.11 frame to the broadcast address on one fixed
- * channel, which anything else listening on that channel hears. The
- * radio, not the packet, is what costs: an unassociated station sits in
- * receive at roughly 80 mA whether it sends ten frames a second or one,
- * so `n` takes WiFi down outright rather than just muting the sends. */
-#define BEACON_CHANNEL 1        /* the other end has to listen on this one */
-#define BEACON_MS      100      /* 10 Hz; the frame itself is tens of us of
-                                   air time, so the rate is nearly free */
-#define BEACON_ID      "freddie"
-#define BEACON_VER     1
-#define BEACON_TX_QDBM 44       /* 11 dBm, in quarter-dB steps: a room's
-                                   worth of range, and a smaller gulp out
-                                   of a pack that's also running two motors
-                                   than the 20 dBm default asks for */
-
-/* Wire format: 21 bytes, little-endian, packed. Later versions may
- * append fields under a new ver; the ones here never move. */
-typedef struct __attribute__((packed)) {
-    char     magic[4];   /* "FRED", not NUL-terminated */
-    uint8_t  ver;        /* BEACON_VER */
-    char     id[8];      /* BEACON_ID, NUL-padded */
-    uint32_t seq;        /* from 0 at boot; gaps are frames that were lost */
-    uint32_t up_ms;      /* uptime, so a reboot reads as one */
-} beacon_t;
-
-static const uint8_t beacon_bcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-static bool beacon_ok;              /* WiFi came up; the task is running */
-static volatile bool beacon_want = true;   /* the console asks... */
-static bool beacon_up;                     /* ...the task obeys, and owns
-                                              the radio: no locking needed */
-static uint32_t beacon_seq;
-
-static bool beacon_fail(const char *what, esp_err_t err)
-{
-    printf("beacon: %s failed (%s)\n", what, esp_err_to_name(err));
-    return false;
-}
-
-/* Channel, power and peer are all properties of a running radio, so
- * they're re-stated on every start, not just the first. */
-static bool beacon_radio_start(void)
-{
-    esp_err_t err = esp_wifi_start();
-    if (err != ESP_OK) {
-        return beacon_fail("wifi start", err);
-    }
-    err = esp_wifi_set_channel(BEACON_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    if (err != ESP_OK) {
-        return beacon_fail("set channel", err);
-    }
-    esp_wifi_set_max_tx_power(BEACON_TX_QDBM);
-    err = esp_now_init();
-    if (err != ESP_OK) {
-        return beacon_fail("esp-now init", err);
-    }
-    esp_now_peer_info_t peer = {
-        .channel = BEACON_CHANNEL,
-        .ifidx = WIFI_IF_STA,
-        .encrypt = false,
-    };
-    memcpy(peer.peer_addr, beacon_bcast, sizeof(peer.peer_addr));
-    err = esp_now_add_peer(&peer);
-    if (err != ESP_OK) {
-        return beacon_fail("add peer", err);
-    }
-    return true;
-}
-
-static void beacon_radio_stop(void)
-{
-    esp_now_deinit();
-    esp_wifi_stop();
-}
-
-static void beacon_task(void *arg)
-{
-    TickType_t wake = xTaskGetTickCount();
-    while (1) {
-        xTaskDelayUntil(&wake, pdMS_TO_TICKS(BEACON_MS));
-        if (beacon_want != beacon_up) {
-            if (beacon_want) {
-                beacon_up = beacon_radio_start();
-                beacon_want = beacon_up;   /* don't retry a failing start */
-                if (beacon_up) {
-                    printf("beacon: on\n");
-                }
-            } else {
-                beacon_radio_stop();
-                beacon_up = false;
-                printf("beacon: off, radio down\n");
-            }
-        }
-        if (!beacon_up) {
-            continue;
-        }
-        beacon_t b = {
-            .magic = { 'F', 'R', 'E', 'D' },
-            .ver = BEACON_VER,
-            .id = BEACON_ID,
-            .seq = beacon_seq++,
-            .up_ms = esp_timer_get_time() / 1000,
-        };
-        /* Fire and forget. A frame that doesn't make it shows up at the
-         * other end as a gap in seq, which is all anyone can do about it
-         * on a broadcast nobody acknowledges. */
-        (void)esp_now_send(beacon_bcast, (const uint8_t *)&b, sizeof(b));
-    }
-}
-
-static void beacon_init(void)
-{
-    esp_err_t err = nvs_flash_init();   /* WiFi keeps its PHY calibration here */
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        err = nvs_flash_init();
-    }
-    if (err != ESP_OK) {
-        beacon_fail("nvs init", err);
-        return;
-    }
-    if ((err = esp_netif_init()) != ESP_OK) {
-        beacon_fail("netif init", err);
-        return;
-    }
-    if ((err = esp_event_loop_create_default()) != ESP_OK) {
-        beacon_fail("event loop", err);
-        return;
-    }
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    if ((err = esp_wifi_init(&cfg)) != ESP_OK) {
-        beacon_fail("wifi init", err);
-        return;
-    }
-    esp_wifi_set_storage(WIFI_STORAGE_RAM);   /* nothing to remember */
-    if ((err = esp_wifi_set_mode(WIFI_MODE_STA)) != ESP_OK) {
-        beacon_fail("wifi mode", err);
-        return;
-    }
-    if (!beacon_radio_start()) {
-        return;
-    }
-    beacon_up = true;
-    beacon_ok = true;
-    uint8_t mac[6];
-    esp_wifi_get_mac(WIFI_IF_STA, mac);
-    printf("beacon: \"%s\" every %d ms on channel %d, from "
-           "%02x:%02x:%02x:%02x:%02x:%02x (n to stop)\n",
-           BEACON_ID, BEACON_MS, BEACON_CHANNEL,
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    xTaskCreate(beacon_task, "beacon", 3072, NULL, 4, NULL);
-}
-
-/* Recorder: 10 Hz snapshots of every sensor plus the commanded motor
- * duties, held state and watcher state, into a PSRAM ring for bench
- * analysis (r to record, d to dump as CSV). PSRAM is wiped by reset —
- * and `idf.py monitor` resets the chip on connect, so retrieve
- * untethered runs with --no-reset. */
-#define REC_SPIRAM_N   36000   /* ~1 h at 10 Hz, ~6 MB of the 8 MB PSRAM */
-#define REC_INTERNAL_N 600     /* ~1 min fallback if PSRAM is absent */
-
-typedef struct {
-    uint32_t ms;
-    int16_t left, right;
-    int16_t px[64];
-    float dps[3], g[3];
-    float volts, ma;
-    uint8_t held;               /* 1 while he's in someone's hands */
-    uint8_t ws;                 /* watcher state: 0 off, 1 rest, 2 look,
-                                   3 reorient (the settle turn), then the
-                                   coax: 4 dwell, 5 nerve, 6 turn, 7 hop,
-                                   8 observe */
-} rec_t;
-
-static rec_t *rec_buf;
-static int rec_cap, rec_head, rec_len;
-
-/* One 10 Hz heartbeat: read the IMU, run bump detection, then snapshot
- * everything for the recorder. */
+/* One 10 Hz heartbeat: read every sensor, run hold/gesture detection,
+ * act on any gesture, and step the watcher. */
 static void tick_task(void *arg)
 {
     TickType_t wake = xTaskGetTickCount();
@@ -1757,9 +1462,7 @@ static void tick_task(void *arg)
             perform_sprint();
         }
         if (watch_duty && !held && esp_timer_get_time() >= watch_cycle_at) {
-            wsay(watch_state == WATCH_OFF ? "watch: waking by himself\n"
-                                            : "watch: nodding off\n");
-            watch_toggle();
+            watch_toggle();   /* waking by himself, or nodding off */
         }
         if (watch_state != WATCH_OFF && imu_ok && px_ok) {
             watch_step(pxbuf, dps, volts, pwr_ok);
@@ -1770,280 +1473,6 @@ static void tick_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(300));
             led_nominal();
         }
-        if (!rec_on || rec_cap == 0) {
-            continue;
-        }
-        rec_t *r = &rec_buf[rec_head];
-        memset(r, 0, sizeof(*r));   /* failed reads log as zeros */
-        r->ms = esp_timer_get_time() / 1000;
-        r->left = cmd_left;
-        r->right = cmd_right;
-        if (px_ok) {
-            memcpy(r->px, pxbuf, sizeof(r->px));
-        }
-        if (imu_ok) {
-            memcpy(r->dps, dps, sizeof(r->dps));
-            memcpy(r->g, g, sizeof(r->g));
-        }
-        if (pwr_ok) {
-            r->volts = volts;
-            r->ma = ma;
-        }
-        r->held = held;
-        r->ws = watch_state;
-        rec_head = (rec_head + 1) % rec_cap;
-        if (rec_len < rec_cap) {
-            rec_len++;
-        }
-    }
-}
-
-static void tick_init(void)
-{
-    rec_cap = REC_SPIRAM_N;
-    rec_buf = heap_caps_malloc(rec_cap * sizeof(rec_t), MALLOC_CAP_SPIRAM);
-    if (rec_buf == NULL) {
-        rec_cap = REC_INTERNAL_N;
-        rec_buf = malloc(rec_cap * sizeof(rec_t));
-    }
-    if (rec_buf == NULL) {
-        rec_cap = 0;   /* bump detection still needs the heartbeat */
-        printf("no memory for the recorder; r/d disabled\n");
-    }
-    xTaskCreate(tick_task, "tick", 4096, NULL, 5, NULL);
-}
-
-static void rec_dump(void)
-{
-    if (rec_on) {
-        printf("still recording; r to stop first\n");
-        return;
-    }
-    printf("ms,left,right,volts,ma,held,ws,gx,gy,gz,ax,ay,az");
-    for (int i = 0; i < 64; i++) {
-        printf(",p%d", i);
-    }
-    printf("\n");
-    int nj = 0;
-    for (int i = 0; i < rec_len; i++) {
-        rec_t *r = &rec_buf[(rec_head - rec_len + i + rec_cap) % rec_cap];
-        /* the narration rides with the numbers, in time order */
-        while (nj < note_len) {
-            note_t *n = &note_buf[(note_head - note_len + nj + NOTE_N) % NOTE_N];
-            if (n->ms > r->ms) {
-                break;
-            }
-            printf("# %lu %s\n", (unsigned long)n->ms, n->text);
-            nj++;
-        }
-        printf("%lu,%d,%d,%.2f,%.0f,%d,%d,%.1f,%.1f,%.1f,%.3f,%.3f,%.3f",
-               (unsigned long)r->ms, r->left, r->right, r->volts, r->ma,
-               r->held, r->ws,
-               r->dps[0], r->dps[1], r->dps[2], r->g[0], r->g[1], r->g[2]);
-        for (int p = 0; p < 64; p++) {
-            printf(",%.2f", r->px[p] * 0.25f);
-        }
-        printf("\n");
-        if ((i & 63) == 63) {
-            /* let IDLE0 breathe: a starved task watchdog spews its
-             * backtraces mid-line into the CSV (sprint.log, 20260806) */
-            vTaskDelay(1);
-        }
-    }
-    for (; nj < note_len; nj++) {
-        note_t *n = &note_buf[(note_head - note_len + nj + NOTE_N) % NOTE_N];
-        printf("# %lu %s\n", (unsigned long)n->ms, n->text);
-    }
-    printf("# %d records\n", rec_len);
-}
-
-/* Calibration script: fixed open-loop drive segments meant to be
- * recorded (r) and analysed on the bench — trim, deadband, breakaway.
- * Each segment starts from standstill so every run exercises the
- * kick-from-rest behaviour, and forward runs are mirrored backward so
- * f1 roughly returns to where he started. Extend the table as needed. */
-static const struct { int left, right; int ms; } cal_seq[] = {
-    { 40, 40, 2500 },  { -40, -40, 2500 },
-    { 50, 50, 2500 },  { -50, -50, 2500 },
-    { 60, 60, 2500 },  { -60, -60, 2500 },
-    { 30, 30, 1500 },  { -30, -30, 1500 },
-    { 25, 25, 1500 },  { -25, -25, 1500 },
-    { 20, 20, 1500 },  { -20, -20, 1500 },
-    { 15, 15, 1500 },  { -15, -15, 1500 },
-};
-
-static void cal_run(int delay_s)
-{
-    if (!rec_on) {
-        printf("cal: note, not recording (r first to log the run)\n");
-    }
-    if (delay_s > 0) {
-        printf("cal: starting in %d s\n", delay_s);
-        countdown_winks(delay_s);
-        led_nominal();
-    }
-    for (int i = 0; i < sizeof(cal_seq) / sizeof(cal_seq[0]); i++) {
-        printf("cal: left %d right %d for %d ms\n",
-               cal_seq[i].left, cal_seq[i].right, cal_seq[i].ms);
-        drive(cal_seq[i].left, cal_seq[i].right);
-        vTaskDelay(pdMS_TO_TICKS(cal_seq[i].ms));
-        drive(0, 0);
-        vTaskDelay(pdMS_TO_TICKS(700));   /* settle, and mark the segment */
-    }
-    printf("cal: done\n");
-}
-
-static void print_help(void)
-{
-    printf("commands:\n"
-           "  m <l> <r> [secs]   set motor speeds, -100..100, after an\n"
-           "                     optional delay (m 20 -20 10)\n"
-           "  s                  stop (coast; the driver sleeps itself)\n"
-           "  t                  thermal frame as an 8x8 heat map, plus\n"
-           "                     the mean\n"
-           "  v                  read pack voltage and current\n"
-           "  g                  read gyro and accelerometer\n"
-           "  w                  watcher on/off (or: double lift-down gesture)\n"
-           "  c [secs]           motor calibration script, after an optional\n"
-           "                     delay to get him on the floor (r first)\n"
-           "  p <which> [secs]   perform, after an optional delay to get\n"
-           "                     him on the floor: a = I'm-alive,\n"
-           "                     h = hello, f = found-you, w = I'm-awake,\n"
-           "                     s = sprint (5 s fuse — floor, stand clear;\n"
-           "                     or: hold upside down 1 s, set down)\n"
-           "  l <r> <g> <b>      set the RGB LED, 0..255 (l 32 0 0)\n"
-           "  n                  ESP-NOW beacon on/off (off drops the radio,\n"
-           "                     which is where the current goes)\n"
-           "  r                  record all sensors at 10 Hz, start/stop\n"
-           "  d                  dump the recording as CSV\n"
-           "  ?                  this help\n");
-}
-
-static void handle_line(char *line)
-{
-    int l, r, cr, cg, cb, dl;
-    char pc;
-    if (sscanf(line, "m %d %d %d", &l, &r, &dl) == 3) {
-        printf("motors: left %d right %d in %d s\n", l, r, dl);
-        countdown_winks(dl);   /* time to put him down */
-        led_nominal();
-        drive(l, r);
-    } else if (sscanf(line, "m %d %d", &l, &r) == 2) {
-        drive(l, r);
-        printf("motors: left %d right %d\n", l, r);
-    } else if (strcmp(line, "s") == 0) {
-        drive(0, 0);
-        printf("motors: stopped\n");
-    } else if (strcmp(line, "t") == 0) {
-        int16_t px[64];
-        if (amg_ok && amg_read_pixels(px) == ESP_OK) {
-            /* the frame as a heat map: blue -> red through the ANSI
-             * 256-colour cube, scaled to the frame itself with a 4 C
-             * floor so an empty room reads flat instead of amplifying
-             * pixel noise (±2.5 C) into a rainbow */
-            static const uint8_t heat[] = {
-                17, 18, 19, 20, 21, 27, 33, 39, 45, 51, 50, 49, 48,
-                47, 46, 82, 118, 154, 190, 226, 220, 214, 208, 202, 196
-            };
-            float t[64], lo = 1000, hi = -1000, sum = 0;
-            for (int i = 0; i < 64; i++) {
-                t[i] = px[i] * 0.25f;
-                sum += t[i];
-                if (t[i] < lo) {
-                    lo = t[i];
-                }
-                if (t[i] > hi) {
-                    hi = t[i];
-                }
-            }
-            float span = hi - lo < 4.0f ? 4.0f : hi - lo;
-            for (int row = 0; row < 8; row++) {
-                for (int col = 0; col < 8; col++) {
-                    float v = t[row * 8 + col];
-                    int idx = (int)((v - lo) / span *
-                                    (sizeof(heat) - 1) + 0.5f);
-                    printf("\x1b[48;5;%dm\x1b[30m%5.1f \x1b[0m",
-                           heat[idx], v);
-                }
-                printf("\n");
-            }
-            printf("mean %.2f C, min %.1f, max %.1f\n", sum / 64, lo, hi);
-        } else {
-            printf("sensor read failed\n");
-        }
-    } else if (strcmp(line, "v") == 0) {
-        float volts, ma;
-        if (ina_ok && ina_read(&volts, &ma) == ESP_OK) {
-            printf("%.2f V, %.0f mA\n", volts, ma);
-        } else {
-            printf("power sensor read failed\n");
-        }
-    } else if (strcmp(line, "g") == 0) {
-        float dps[3], g[3];
-        if (lsm_ok && lsm_read(dps, g) == ESP_OK) {
-            printf("gyro %7.1f %7.1f %7.1f dps  accel %6.2f %6.2f %6.2f g\n",
-                   dps[0], dps[1], dps[2], g[0], g[1], g[2]);
-        } else {
-            printf("motion sensor read failed\n");
-        }
-    } else if (sscanf(line, "p %c", &pc) == 1) {
-        int delay = 0;
-        sscanf(line, "p %*c %d", &delay);
-        if (delay > 0) {
-            /* like c [secs]: time to unplug and get him on the floor */
-            countdown_winks(delay);
-        }
-        if (pc == 'a') {
-            perform_alive();
-            printf("performance: done\n");
-        } else if (pc == 'h') {
-            perform_hello();
-            printf("performance: done\n");
-        } else if (pc == 'f') {
-            perform_found();
-            printf("performance: done\n");
-        } else if (pc == 'w') {
-            perform_awake();
-            printf("performance: done\n");
-        } else if (pc == 's') {
-            perform_sprint();
-        } else {
-            printf("no such performance: %c\n", pc);
-        }
-    } else if (sscanf(line, "l %d %d %d", &cr, &cg, &cb) == 3) {
-        rgb_set(cr, cg, cb);
-        printf("led: %d %d %d\n", cr, cg, cb);
-    } else if (strcmp(line, "r") == 0) {
-        if (rec_cap == 0) {
-            printf("recorder disabled (no memory)\n");
-        } else if (rec_on) {
-            rec_on = false;
-            printf("recording stopped: %d records (d to dump)\n", rec_len);
-        } else {
-            rec_head = 0;
-            rec_len = 0;   /* each run starts fresh */
-            note_head = 0;
-            note_len = 0;
-            rec_on = true;
-            printf("recording at %d Hz (r to stop)\n", TICK_HZ);
-        }
-    } else if (strcmp(line, "n") == 0) {
-        if (!beacon_ok) {
-            printf("beacon: not running\n");
-        } else {
-            beacon_want = !beacon_want;   /* the task acts on it next tick */
-            printf("beacon: %s\n", beacon_want ? "starting" : "stopping");
-        }
-    } else if (strcmp(line, "d") == 0) {
-        rec_dump();
-    } else if (strcmp(line, "w") == 0) {
-        watch_toggle();
-    } else if (line[0] == 'c' && (line[1] == '\0' || line[1] == ' ')) {
-        int delay = 0;
-        sscanf(line, "c %d", &delay);
-        cal_run(delay);
-    } else {
-        print_help();
     }
 }
 
@@ -2057,53 +1486,16 @@ void app_main(void)
     amg_init();
     ina_init();
     lsm_init();
-    tick_init();
-    beacon_init();
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0));
-    print_help();
+    xTaskCreate(tick_task, "tick", 4096, NULL, 5, NULL);
 
-    /* The performance is for switch-on only. A brownout, panic or a
-     * glitched EN line (USB DTR/RTS) also lands here, and answering a
-     * brownout with a motor dance invites the next one. */
-    esp_reset_reason_t rr = esp_reset_reason();
-    printf("reset reason: %d (%s)\n", rr,
-           rr == ESP_RST_POWERON ? "power-on" :
-           rr == ESP_RST_BROWNOUT ? "brownout" :
-           rr == ESP_RST_PANIC ? "panic" :
-           rr == ESP_RST_SW ? "software" :
-           rr == ESP_RST_EXT ? "external pin" :
-           rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT ||
-           rr == ESP_RST_WDT ? "watchdog" : "other");
+    /* The switch-on performance is for a fresh power-on only. A
+     * brownout, panic or a glitched EN line (USB DTR/RTS) also lands
+     * here, and answering a brownout with a motor dance invites the
+     * next one. Failed checks: stay red and still. */
     if (amg_ok && ina_ok && lsm_ok) {
         led_nominal();   /* he boots up asleep: the ember */
-        if (rr == ESP_RST_POWERON) {
+        if (esp_reset_reason() == ESP_RST_POWERON) {
             perform_alive();
-        } else {
-            printf("startup: skipping the performance (not a fresh power-on)\n");
-        }
-        printf("startup: all checks passed\n");
-    } else {
-        printf("startup: checks failed, staying red and still\n");
-    }
-
-    char line[64];
-    int len = 0;
-    while (1) {
-        uint8_t c;
-        if (uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(100)) <= 0) {
-            continue;
-        }
-        if (c == '\r' || c == '\n') {
-            putchar('\n');
-            if (len > 0) {
-                line[len] = '\0';
-                handle_line(line);
-                len = 0;
-            }
-        } else if (len < (int)sizeof(line) - 1) {
-            line[len++] = c;
-            putchar(c);   /* echo so the monitor shows what you type */
-            fflush(stdout);
         }
     }
 }
