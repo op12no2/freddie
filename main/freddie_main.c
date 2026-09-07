@@ -3,11 +3,11 @@
  * onboard RGB status LED, and a discrete "running" LED on the shelf.
  *
  * The whole behaviour: spin on the spot, slowing as warmth crosses the
- * view; when something warm sits near the middle of the frame, chase it,
- * flat out at first and easing off as it grows, steering on its centroid;
- * stand still when it's right at his wheels; push against something and
- * that's a tag — back off, turn away, spin again; lose it and spin again.
- * A game of tag. Nothing else.
+ * view; when something warm sits near the middle of the frame, chase it
+ * flat out, steering on its centroid, until he loses it or runs into it;
+ * either way, look around again (a run-in earns a back-off and a turn
+ * away first). He's the one doing the tagging; it's on you to get out of
+ * the way. Nothing else.
  *
  * A serial console (idf.py monitor, '?' for help) shows the thermal
  * frame for tuning; it's for the bench, not the behaviour. */
@@ -399,17 +399,11 @@ static void drive(int left_pct, int right_pct)
 #define CENTER_COL     3.2f   /* boresight column (measured) */
 #define LOCK_COLS      1.0f   /* blob this near boresight during the scan:
                                  go for it */
-#define GO_PCT         100    /* follow duty with the target small: a chase */
-#define GO_MIN_PCT     30     /* ...easing to this as it grows to FULL_PX, so
-                                 he arrives at a walk, not a sprint */
+#define GO_PCT         100    /* follow duty: a chase, all the way in. No
+                                 slowing, no stopping short — he's small,
+                                 and getting out of his way is the game */
 #define STEER_K        25.0f  /* inner-wheel duty shed per column the
                                  target sits off boresight */
-#define FULL_PX        24     /* the target this big = right at his wheels:
-                                 stand still until it backs off (1 m from a
-                                 crouching child fills 14 px, gestures.log) */
-#define FULL_HYST_PX   4      /* it must shrink this much below FULL_PX
-                                 before he moves again: no jackhammering
-                                 at shins over a flickering pixel */
 #define LOST_TICKS     10     /* stand still this long without the target,
                                  then look around */
 #define STALL_MA       900.0f /* pack current with the motors commanded =
@@ -432,7 +426,6 @@ static state_t state;
 static int scan_sign;      /* spin direction this scan */
 static int lost;           /* consecutive ticks without the target */
 static int locking;        /* consecutive ticks with a target near boresight */
-static bool close;         /* at his wheels: standing still until it backs off */
 static int stalled;        /* consecutive ticks pushing on something */
 static int ticks_left;     /* back-off remaining, or turn timeout */
 static float turn_deg;     /* the about-face: degrees wanted... */
@@ -494,7 +487,6 @@ static void enter(state_t s)
     lost = 0;
     locking = 0;
     stalled = 0;
-    close = false;
     switch (s) {
     case SCAN:
         scan_sign = (esp_random() & 1) ? 1 : -1;
@@ -594,24 +586,12 @@ static void tick_task(void *arg)
                 break;
             }
             lost = 0;
-            if (n >= FULL_PX) {
-                close = true;
-            } else if (n < FULL_PX - FULL_HYST_PX) {
-                close = false;
-            }
-            if (close) {
-                drive(0, 0);   /* caught up: wait for them to move */
-                break;
-            }
-            /* ease off as the target grows: flat out at a distance, a
-             * walk by the time it's nearly at his wheels */
-            int base = GO_PCT - (GO_PCT - GO_MIN_PCT) * n / FULL_PX;
             /* sign field-tested: image columns run mirrored, so a
              * centroid right of boresight means the target is to his
              * left — shed the left wheel */
             int turn = (int)(STEER_K * (col - CENTER_COL));
-            drive(clamp_pct(base - (turn > 0 ? turn : 0)),
-                  clamp_pct(base + (turn < 0 ? turn : 0)));
+            drive(clamp_pct(GO_PCT - (turn > 0 ? turn : 0)),
+                  clamp_pct(GO_PCT + (turn < 0 ? turn : 0)));
             break;
         }
         case BACK: {
@@ -670,8 +650,7 @@ static void print_frame(void)
     printf("  %s%s  ambient %.2f  blob %d px", state_name(),
            frozen ? " (frozen)" : "", ref, n);
     if (n > 0) {
-        printf("  col %.2f (off %+.2f)%s", col, col - CENTER_COL,
-               n >= FULL_PX ? "  FULL" : "");
+        printf("  col %.2f (off %+.2f)", col, col - CENTER_COL);
     }
     printf("\n  pack %.2f V %.0f mA  motors %d/%d\n", pack_v, pack_ma,
            cmd_left, cmd_right);

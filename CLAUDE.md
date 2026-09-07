@@ -7,10 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Firmware for Freddie, an autonomous ESP32-S3 robot (see README.md for the
 parts list). He watches the room through an 8x8 thermal camera and plays
 tag: spin on the spot, slowing as warmth crosses his view; when something
-warm sits near the middle of the frame, chase it, flat out at first and
-easing off as it grows, steering on its centroid; stand still when it's
-right at his wheels; push against something and that's a tag — back off,
-turn away, spin again; lose it and spin again. The firmware is fully autonomous and deliberately minimal: no
+warm sits near the middle of the frame, chase it flat out, steering on its
+centroid, until he loses it or runs into it; either way look around again
+(a run-in earns a back-off and a turn away first). He does the tagging;
+getting out of his way is the game. There is deliberately no slowing or
+stopping short — that made the child the chaser, which is backwards. The firmware is fully autonomous and deliberately minimal: no
 radio, no logging — the LEDs are his whole interface. There is a small
 serial console for the bench (`idf.py monitor`, `?` for help): `p` prints
 the thermal frame with target pixels starred, `s` streams it, `x` freezes
@@ -88,15 +89,16 @@ the tick honours by stopping the motors and skipping the state machine.
   carried over unchanged from the old firmware; it works well, don't
   fiddle with it. Target centroid within `LOCK_COLS` of boresight
   (`CENTER_COL`) for `LOCK_TICKS` running = `FOLLOW`.
-- `FOLLOW`: drive at a duty easing from `GO_PCT` (100) with a small target
-  to `GO_MIN_PCT` as it grows to `FULL_PX`, shedding `STEER_K` of the inner
+- `FOLLOW`: drive at `GO_PCT` (100), shedding `STEER_K` of the inner
   wheel's duty per column the centroid sits off boresight. Image columns
   run mirrored to the drive sign (field tested); the sign in the code is
-  right. Target at `FULL_PX` or more = stand still (`close`) until it
-  shrinks by `FULL_HYST_PX`. No target = stand still (never charge blind),
-  and after `LOST_TICKS` of that, `SCAN`. Motors commanded but pack
-  current over `STALL_MA` for `STALL_TICKS` = he's pushing on something:
-  a tag, `BACK`. `STALL_MA` is a guess until measured with the console.
+  right. No target = stand still (never charge blind), and after
+  `LOST_TICKS` of that, `SCAN` — which is also how a chase ends up close:
+  past half the frame the coldest-half ambient can't separate the target
+  from the scene, so it vanishes. Motors commanded but pack current over
+  `STALL_MA` for `STALL_TICKS` = he's pushing on something: a tag, `BACK`.
+  `STALL_MA` has to sit high or launches on carpet trip it; a missed tag
+  is harmless, he just loses them and scans.
 - `BACK`: reverse at `BACK_PCT` for `BACK_MS`, violet, then `TURN`.
 - `TURN`: spin at `TURN_PCT` through a random `TURN_MIN_DEG`..`TURN_MAX_DEG`,
   gyro-metered with `TURN_TIMEOUT_S` as the backstop, then `SCAN`.
