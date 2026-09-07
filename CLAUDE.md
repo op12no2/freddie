@@ -9,9 +9,13 @@ parts list). He watches the room through an 8x8 thermal camera and does one
 thing: spin one circle on the spot, slowing as warmth crosses his view,
 then rest half a minute and spin again; when something warm sits near the
 middle of the frame, drive at it, steering on its centroid, until it fills
-the frame; sit there while it does; lose it and go back to circling. The firmware is fully autonomous and deliberately minimal:
-there is no console, no radio, no logging — the LEDs are his whole
-interface.
+the frame; sit there while it does; lose it and go back to circling. The
+firmware is fully autonomous and deliberately minimal: no radio, no
+logging — the LEDs are his whole interface. There is a small serial
+console for the bench (`idf.py monitor`, `?` for help): `p` prints the
+thermal frame with target pixels starred, `s` streams it, `x` freezes
+the motors while sensing continues. It's for tuning thresholds, not part
+of the behaviour.
 
 This is a deliberate reset. An earlier, much richer firmware (sleep/wake
 rhythm, gestures, performances, a cautious hop-and-observe approach) lives
@@ -60,8 +64,12 @@ workflow.
 
 **Concurrency model**: one FreeRTOS task, `tick_task`, at `TICK_HZ`
 (10 Hz). Each tick it reads the thermal frame and the IMU and steps a
-four-state machine (`state_t`: `SCAN`, `REST`, `APPROACH`, `ARRIVED`). `app_main()`
-initialises the peripherals and, if every check passed, starts the task.
+four-state machine (`state_t`: `SCAN`, `REST`, `APPROACH`, `ARRIVED`).
+`app_main()` initialises the peripherals, starts the task if every check
+passed, then runs the console loop on UART0 forever. The tick task
+publishes its latest frame (`last_t`, `last_mean`) for the console's
+`print_frame`; the console's `x` sets `frozen`, which the tick honours by
+stopping the motors and skipping the state machine.
 
 **The behaviour**:
 - `SCAN`: spin at `SPIN_PCT`, shedding duty in proportion to the frame's

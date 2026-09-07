@@ -1,14 +1,18 @@
 /* firmware: Freddie the robot. AMG8833 thermal camera, LSM6DSOX IMU and
  * INA219 power monitor on one I2C bus, DRV8833 motors, and the DevKit's
- * onboard RGB status LED.
+ * onboard RGB status LED. Plus an "awake" LED.
  *
  * The whole behaviour: spin one circle on the spot, slowing as warmth
  * crosses the view, then rest half a minute and spin again; when something
  * warm sits near the middle of the frame, drive at it, steering on its
  * centroid, until it fills the frame; sit there while it does; lose it
- * and go back to the circling. Nothing else. */
+ * and go back to the circling. Nothing else.
+ *
+ * A serial console (idf.py monitor, '?' for help) shows the thermal
+ * frame for tuning; it's for the bench, not the behaviour. */
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "driver/gpio.h"
@@ -16,6 +20,7 @@
 #include "driver/ledc.h"
 #include "driver/rmt_encoder.h"
 #include "driver/rmt_tx.h"
+#include "driver/uart.h"
 #include "esp_random.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -405,6 +410,11 @@ static float ambient;      /* frozen reference the target is measured
                               *is* the mean */
 static int lost;           /* consecutive ticks without the target */
 
+/* For the console: the latest frame and what the behaviour made of it. */
+static float last_t[64];
+static float last_mean;
+static volatile bool frozen;   /* console 'x': sense, but don't move */
+
 /* Blob of pixels BLOB_C over ref: its weight in pixels, and its centroid
  * column when there is one. */
 static int blob(const float t[64], float ref, float *col)
@@ -499,6 +509,14 @@ static void tick_task(void *arg)
             }
         }
         float mean = sum / 64;
+        for (int i = 0; i < 64; i++) {
+            last_t[i] = t[i];
+        }
+        last_mean = mean;
+        if (frozen) {
+            drive(0, 0);
+            continue;
+        }
 
         switch (state) {
         case SCAN: {
@@ -575,6 +593,106 @@ static void tick_task(void *arg)
     }
 }
 
+static const char *state_name(void)
+{
+    switch (state) {
+    case SCAN: return "scan";
+    case REST: return "rest";
+    case APPROACH: return "approach";
+    case ARRIVED: return "arrived";
+    }
+    return "?";
+}
+
+/* The frame as the sensor delivers it: row 0 first, column 0 first.
+ * Pixels the behaviour counts as the target are starred, against the
+ * reference the current state uses. */
+static void print_frame(void)
+{
+    float t[64];
+    for (int i = 0; i < 64; i++) {
+        t[i] = last_t[i];
+    }
+    float mean = last_mean;
+    float ref = (state == APPROACH || state == ARRIVED) ? ambient : mean;
+    float col = 0;
+    int n = blob(t, ref, &col);
+    int rsum = 0, lowest = -1, highest = -1;
+    for (int i = 0; i < 64; i++) {
+        if (t[i] - ref >= BLOB_C) {
+            rsum += i / 8;
+            if (highest < 0) {
+                highest = i / 8;
+            }
+            lowest = i / 8;
+        }
+    }
+    printf("      ");
+    for (int c = 0; c < 8; c++) {
+        printf("   c%d ", c);
+    }
+    printf("\n");
+    for (int r = 0; r < 8; r++) {
+        printf("  r%d  ", r);
+        for (int c = 0; c < 8; c++) {
+            float v = t[r * 8 + c];
+            printf("%5.1f%c", v, v - ref >= BLOB_C ? '*' : ' ');
+        }
+        printf("\n");
+    }
+    printf("  %s%s  mean %.2f  ref %.2f (%s)  blob %d px",
+           state_name(), frozen ? " (frozen)" : "", mean, ref,
+           ref == mean ? "frame mean" : "frozen ambient", n);
+    if (n > 0) {
+        printf("  col %.2f (off %+.2f)  rows %d..%d (centroid %.2f)",
+               col, col - CENTER_COL, highest, lowest, (float)rsum / n);
+    }
+    printf("\n");
+}
+
+static void print_help(void)
+{
+    printf("freddie console: ? help, p frame, s stream frames (any key stops), "
+           "x freeze/unfreeze motors\n");
+}
+
+static void console(void)
+{
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0));
+    print_help();
+    bool stream = false;
+    while (1) {
+        uint8_t c;
+        if (uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(500)) <= 0) {
+            if (stream) {
+                print_frame();
+            }
+            continue;
+        }
+        if (stream) {
+            stream = false;   /* any key stops the stream */
+            continue;
+        }
+        switch (c) {
+        case '?':
+            print_help();
+            break;
+        case 'p':
+            print_frame();
+            break;
+        case 's':
+            stream = true;
+            break;
+        case 'x':
+            frozen = !frozen;
+            printf("motors %s\n", frozen ? "frozen" : "free");
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 void app_main(void)
 {
     rgb_init();
@@ -587,8 +705,11 @@ void app_main(void)
     lsm_init();
 
     /* Failed checks: stay red and still. */
+    printf("startup: amg %s, ina %s, lsm %s\n", amg_ok ? "ok" : "MISSING",
+           ina_ok ? "ok" : "MISSING", lsm_ok ? "ok" : "MISSING");
     if (amg_ok && ina_ok && lsm_ok) {
         gpio_set_level(WAKE_LED_GPIO, 1);
         xTaskCreate(tick_task, "tick", 4096, NULL, 5, NULL);
     }
+    console();   /* never returns */
 }
