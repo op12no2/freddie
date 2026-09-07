@@ -4,17 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Firmware for Freddie, an autonomous ESP32-S3 robot (see README.md for the full
-behavioral description). He watches a room through an 8x8 thermal camera,
-notices changes in warmth, and reacts with LED colour, small motor
-"performances", and — if something warm lingers and moves like a person — a
-cautious hopping approach. He has a sleep/wake rhythm and can be picked up
-and set down as a gestural interface (double lift-down toggles the watcher;
-holding him upside down for a second arms a "sprint"). The firmware is fully
-autonomous and deliberately minimal: there is no console, no radio, no
-logging — the LEDs and the gestures are his whole interface.
+Firmware for Freddie, an autonomous ESP32-S3 robot (see README.md for the
+parts list). He watches the room through an 8x8 thermal camera and does one
+thing: spin on the spot, slowing as warmth crosses his view; when something
+warm sits near the middle of the frame, drive at it, steering on its
+centroid, until it fills the frame; sit there while it does; lose it and
+spin again. The firmware is fully autonomous and deliberately minimal:
+there is no console, no radio, no logging — the LEDs are his whole
+interface.
 
-The entire firmware is one file: `main/freddie_main.c` (~1300 lines). There
+This is a deliberate reset. An earlier, much richer firmware (sleep/wake
+rhythm, gestures, performances, a cautious hop-and-observe approach) lives
+in git history before the reset commit; the idea is to re-evolve from this
+base slowly, picking behaviours back out of those commits one at a time,
+only once the basic scan-and-approach is right.
+
+The entire firmware is one file: `main/freddie_main.c` (~540 lines). There
 is no test suite — this is embedded C for one physical device, and
 correctness is checked by flashing it and watching him.
 
@@ -37,64 +42,48 @@ workflow.
 
 **Peripherals**, all initialized in `app_main()`:
 - AMG8833 thermal camera, INA219 power/current monitor, LSM6DSOX IMU — all
-  on one I2C bus (`i2c_init`, then per-device `*_init`/`*_read`).
+  on one I2C bus (`i2c_init`, then per-device `*_init`). Only the camera is
+  read by the behaviour. The INA219 backs `pack_live()`, which refuses to
+  drive the motors on USB power alone. The IMU is initialised for the boot
+  check only and otherwise unused for now.
 - DRV8833 dual motor driver via LEDC PWM (`motors_init`, `motor_set`,
   `drive`). Note the wiring is physically crossed and inverted versus the
   DRV8833's own pin names — this is corrected once in the `MOTOR_*_GPIO`
   macros near the top of the file, so `drive(left, right)` downstream is
   sane; don't "fix" the apparent crossing there.
-- Onboard WS2812 RGB status LED via RMT (`rgb_init`/`rgb_set`) — the robot's
-  only expressive output besides motion. Colour meanings are enumerated as
-  `RGB_*` macros (red = booting/failed check, green = idle awake/asleep
-  graded by brightness, blue = performing, violet = held, amber = noticing).
-- A discrete GPIO LED (`WAKE_LED_GPIO`) mirrors awake/asleep for
-  sunlight-readability where the dim RGB ember isn't visible.
+- Onboard WS2812 RGB status LED via RMT (`rgb_init`/`rgb_set`). Colour
+  meanings are the `RGB_*` macros: red = booting/failed check, green =
+  scanning, blue = approaching, amber = arrived.
+- A discrete GPIO LED (`WAKE_LED_GPIO`) is lit whenever the checks passed
+  and he's running.
 
-**Concurrency model**: one FreeRTOS task does everything — `tick_task`,
-running at `TICK_HZ` (10 Hz). Each tick it reads all sensors, runs
-hold/gesture detection (`held_check`), acts on any completed gesture, and
-advances the autonomous watch state machine (`watch_step`). `app_main()`
-initializes the peripherals, starts the task, runs the switch-on
-performance, and returns.
+**Concurrency model**: one FreeRTOS task, `tick_task`, at `TICK_HZ`
+(10 Hz). Each tick it reads the thermal frame and steps a three-state
+machine (`state_t`: `SCAN`, `APPROACH`, `ARRIVED`). `app_main()`
+initialises the peripherals and, if every check passed, starts the task.
 
-**Two state machines drive behavior, both stepped from `tick_task`:**
+**The behaviour**:
+- `SCAN`: spin at `SPIN_PCT`, shedding duty in proportion to the frame's
+  max-minus-mean contrast (`GAZE_K`, `GAZE_DEAD_C`, floor `SPIN_MIN_PCT`)
+  so the gaze lingers on warmth. This slow-on-heat sweep is the one piece
+  carried over unchanged from the old firmware; it works well, don't
+  fiddle with it. When a blob (`blob()`: pixels `BLOB_C` over the frame
+  mean, at least `BLOB_MIN_PX` of them) has its centroid within
+  `LOCK_COLS` of boresight (`CENTER_COL`), freeze the non-blob mean as
+  `ambient` and enter `APPROACH`.
+- `APPROACH`: drive at `GO_PCT`, steering by `STEER_K` per column the blob
+  centroid sits off boresight. The blob is measured against the frozen
+  `ambient`, not the live frame mean, because a target that fills the
+  frame *is* the mean. Image columns run mirrored to the drive sign (field
+  tested); the sign in the code is right. Blob weight reaching `FILL_PX`
+  = `ARRIVED`; no blob for `LOST_TICKS` = back to `SCAN`.
+- `ARRIVED`: motors off. Blob shrinking below `FILL_PX - FILL_HYST_PX` =
+  follow (`APPROACH`); gone for `LOST_TICKS` = `SCAN`.
 
-1. **Hold/gesture detection** (`held_check`, static state near the
-   `HELD_*` macros): distinguishes "picked up" from normal driving-induced
-   rotation using gyro magnitude when idle vs. Z-axis tilt when driving.
-   Tracks a flip (held upside-down) gesture that arms a sprint performance
-   on set-down, and a double lift-down gesture (`gest_toggle`) that toggles
-   the watcher on/off. A hold that spikes but doesn't linger long enough
-   registers as `knock_felt` — a poke, not a pickup — which the watch state
-   machine turns into a startle.
-
-2. **Autonomous watcher** (`watch_step`, `watch_state_t`: `WATCH_OFF`,
-   `REST`, `LOOK`, `ORIENT`, `DWELL`, `NERVE`, `CTURN`, `HOP`, `OBS`):
-   periodically wakes from `REST` to spin and scan the thermal frame against
-   a slowly-adapting background (`watch_bg`), settles facing the warmest/
-   most-changed direction, and — if a heat blob persists and moves like a
-   person rather than drifting like ambient warmth — works through the
-   `coax_*` functions (blob centroid tracking, hop odds, nerve) to hop
-   closer in short bursts, backing off if the target moves away. A separate
-   slow cycle (`watch_cycle_at`, `watch_toggle`) drives sleep/wake spans
-   whose length is modulated by "tiredness", itself derived from an EMA of
-   resting pack voltage (`watch_vrest`/`watch_mood`/`watch_tired`) — a
-   flatter battery means shorter looks and shorter awake spans, closer to
-   the real reason batteries call it a night. Timings throughout this
-   machine are drawn from a log-normal distribution
-   (`watch_lognormal_s`/`watch_frand`) rather than fixed intervals, so the
-   rhythm doesn't feel mechanical.
-
-**Performances** (`perform_alive`, `perform_hello`, `perform_awake`,
-`perform_found`, `perform_sprint`): short canned LED+motor sequences
-triggered by the state machines above. `perform_sprint` is fenced by
-`sprint_safe()` checks (handling, tilt, unexpected rotation) that abort
-the run rather than fight a robot that's tipped or in hands.
-
-Many thresholds carry comments citing measured logs (`gestures.log`,
-`quiet_room_sat.log`, cal runs) from before the firmware was simplified;
-the numbers are load-bearing even though the recording machinery that
-produced them is gone.
+Thresholds carry comments citing measured logs (`gestures.log`,
+`quiet_room_sat.log`, cal runs) from the old firmware; the numbers are
+load-bearing even though the recording machinery that produced them is
+gone.
 
 ## Repo layout
 
