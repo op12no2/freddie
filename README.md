@@ -4,6 +4,8 @@ A little autonomous robot that chases you. He spins on the spot looking through 
 
 Freddie handles stalls and bumps by reversing out and spinning; looking.
 
+An alternative game is to coax Freddie around a course that you set.
+
 ## LED
 
 - Green - spinning, looking for you.
