@@ -397,7 +397,7 @@ static void drive(int left_pct, int right_pct)
                                  mean by +2.0-2.4 C (gestures.log) */
 #define BLOB_MIN_PX    2      /* one noise pixel (±2.5 C) isn't a target */
 #define CENTER_COL     3.2f   /* boresight column (measured) */
-#define LOCK_COLS      1.0f   /* blob this near boresight during the scan:
+#define LOCK_COLS      2.0f   /* blob this near boresight during the scan:
                                  go for it */
 #define GO_PCT         100    /* follow duty: a chase, all the way in. No
                                  slowing, no stopping short — he's small,
