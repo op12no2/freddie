@@ -57,7 +57,7 @@ workflow.
 - Onboard WS2812 RGB status LED via RMT (`rgb_init`/`rgb_set`). Colour
   meanings are the `RGB_*` macros: red = booting/failed check, green =
   scanning, blue = following.
-- A discrete GPIO LED (`WAKE_LED_GPIO`) is lit whenever the checks passed
+- A discrete GPIO LED (`RUN_LED_GPIO`) is lit whenever the checks passed
   and he's running.
 
 **Concurrency model**: one FreeRTOS task, `tick_task`, at `TICK_HZ`

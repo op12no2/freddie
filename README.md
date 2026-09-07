@@ -1,6 +1,9 @@
 # Freddie
 
-A shy little autonomous robot.
+A little autonomous robot that plays tag: he spins on the spot watching
+the room through a thermal camera, slows as warmth crosses his view, and
+when someone's in the middle of it, chases them flat out until they're at
+his wheels or he loses them — then looks around again.
 
 ## Parts
 

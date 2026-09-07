@@ -1,6 +1,6 @@
 /* firmware: Freddie the robot. AMG8833 thermal camera, LSM6DSOX IMU and
  * INA219 power monitor on one I2C bus, DRV8833 motors, and the DevKit's
- * onboard RGB status LED. Plus an "awake" LED.
+ * onboard RGB status LED, and a discrete "running" LED on the shelf.
  *
  * The whole behaviour: spin on the spot, slowing as warmth crosses the
  * view; when something warm sits near the middle of the frame, chase it,
@@ -68,7 +68,7 @@
 #define RGB_GREEN       0, 32, 0
 #define RGB_BLUE        0, 0, 48
 
-#define WAKE_LED_GPIO   11     /* discrete orange LED, 1 kOhm to GND, on the
+#define RUN_LED_GPIO    11     /* discrete orange LED, 1 kOhm to GND, on the
                                   shelf: lit whenever he's running */
 
 #define MOTOR_L_IN1_CH  LEDC_CHANNEL_0
@@ -185,6 +185,8 @@ static esp_err_t ina_read(float *volts, float *milliamps)
     return ESP_OK;
 }
 
+/* The IMU isn't used by the behaviour; it's initialised so the boot
+ * check proves the whole bus, and so it's ready when it's wanted. */
 static void lsm_init(void)
 {
     lsm = i2c_add(LSM_I2C_ADDR);
@@ -224,12 +226,12 @@ static void rgb_init(void)
     ESP_ERROR_CHECK(rmt_new_bytes_encoder(&enc_cfg, &rgb_enc));
     ESP_ERROR_CHECK(rmt_enable(rgb_chan));
 
-    gpio_config_t wake_cfg = {
-        .pin_bit_mask = 1ULL << WAKE_LED_GPIO,
+    gpio_config_t run_cfg = {
+        .pin_bit_mask = 1ULL << RUN_LED_GPIO,
         .mode = GPIO_MODE_OUTPUT,
     };
-    ESP_ERROR_CHECK(gpio_config(&wake_cfg));
-    gpio_set_level(WAKE_LED_GPIO, 0);   /* dark until the checks pass */
+    ESP_ERROR_CHECK(gpio_config(&run_cfg));
+    gpio_set_level(RUN_LED_GPIO, 0);   /* dark until the checks pass */
 }
 
 static void rgb_set(uint8_t r, uint8_t g, uint8_t b)
@@ -629,7 +631,7 @@ void app_main(void)
     printf("startup: amg %s, ina %s, lsm %s\n", amg_ok ? "ok" : "MISSING",
            ina_ok ? "ok" : "MISSING", lsm_ok ? "ok" : "MISSING");
     if (amg_ok && ina_ok && lsm_ok) {
-        gpio_set_level(WAKE_LED_GPIO, 1);
+        gpio_set_level(RUN_LED_GPIO, 1);
         rgb_set(RGB_GREEN);   /* checks passed; still while the camera settles */
         xTaskCreate(tick_task, "tick", 4096, NULL, 5, NULL);
     }
