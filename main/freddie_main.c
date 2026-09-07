@@ -360,7 +360,7 @@ static void drive(int left_pct, int right_pct)
 #define LOCK_TICKS     3      /* the target must sit near boresight this
                                  many ticks running before he goes: one
                                  noisy frame can't launch him */
-#define SPIN_PCT       20     /* scan duty (pre-remap) */
+#define SPIN_PCT       30     /* scan duty (pre-remap) */
 #define SPIN_MIN_PCT   1      /* gaze-drag floor: linger, never stall */
 #define GAZE_K         8.0f   /* duty shed per C of passing warmth */
 #define GAZE_DEAD_C    0.8f   /* scene contrast to ignore (empty-room
