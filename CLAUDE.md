@@ -7,13 +7,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Firmware for Freddie, an autonomous ESP32-S3 robot (see README.md for the
 parts list). He watches the room through an 8x8 thermal camera and plays
 tag: spin on the spot, slowing as warmth crosses his view; when something
-warm sits near the middle of the frame, chase it flat out, steering on its
-centroid; stand still when it's right at his wheels; lose it and spin
-again. The firmware is fully autonomous and deliberately minimal: no
+warm sits near the middle of the frame, chase it, flat out at first and
+easing off as it grows, steering on its centroid; stand still when it's
+right at his wheels; push against something and that's a tag — back off,
+turn away, spin again; lose it and spin again. The firmware is fully autonomous and deliberately minimal: no
 radio, no logging — the LEDs are his whole interface. There is a small
 serial console for the bench (`idf.py monitor`, `?` for help): `p` prints
 the thermal frame with target pixels starred, `s` streams it, `x` freezes
-the motors while sensing continues. It's for tuning thresholds, not part
+the motors while sensing continues. The status line carries pack volts
+and mA and the commanded duties, for setting `STALL_MA`. It's for tuning thresholds, not part
 of the behaviour.
 
 This is a deliberate reset. An earlier, much richer firmware (sleep/wake
@@ -45,10 +47,11 @@ workflow.
 
 **Peripherals**, all initialized in `app_main()`:
 - AMG8833 thermal camera, INA219 power/current monitor, LSM6DSOX IMU — all
-  on one I2C bus (`i2c_init`, then per-device `*_init`). The camera drives
-  the behaviour; the INA219 backs `pack_live()`, which refuses to drive
-  the motors on USB power alone; the IMU is initialised for the boot check
-  only and otherwise unused for now.
+  on one I2C bus (`i2c_init`, then per-device `*_init`/`*_read`). The
+  camera drives the behaviour; the INA219's pack current is the tag
+  sensor (a stall reads as a push) and backs `pack_live()`, which refuses
+  to drive the motors on USB power alone; the gyro Z axis meters the
+  turn-away after a tag.
 - DRV8833 dual motor driver via LEDC PWM (`motors_init`, `motor_set`,
   `drive`). Note the wiring is physically crossed and inverted versus the
   DRV8833's own pin names — this is corrected once in the `MOTOR_*_GPIO`
@@ -56,13 +59,13 @@ workflow.
   sane; don't "fix" the apparent crossing there.
 - Onboard WS2812 RGB status LED via RMT (`rgb_init`/`rgb_set`). Colour
   meanings are the `RGB_*` macros: red = booting/failed check, green =
-  scanning, blue = following.
+  scanning, blue = following, violet = tagged.
 - A discrete GPIO LED (`RUN_LED_GPIO`) is lit whenever the checks passed
   and he's running.
 
 **Concurrency model**: one FreeRTOS task, `tick_task`, at `TICK_HZ`
-(10 Hz). Each tick it reads the thermal frame and steps a two-state
-machine (`state_t`: `SCAN`, `FOLLOW`). `app_main()` initialises the
+(10 Hz). Each tick it reads the pack, the IMU and the thermal frame and
+steps a four-state machine (`state_t`: `SCAN`, `FOLLOW`, `BACK`, `TURN`). `app_main()` initialises the
 peripherals, starts the task if every check passed, then runs the console
 loop on UART0 forever. The task holds still for `SETTLE_S` before its
 first scan: the AMG8833's first frames after reset are junk and once
@@ -85,12 +88,18 @@ the tick honours by stopping the motors and skipping the state machine.
   carried over unchanged from the old firmware; it works well, don't
   fiddle with it. Target centroid within `LOCK_COLS` of boresight
   (`CENTER_COL`) for `LOCK_TICKS` running = `FOLLOW`.
-- `FOLLOW`: drive at `GO_PCT` (100), shedding `STEER_K` of the inner
+- `FOLLOW`: drive at a duty easing from `GO_PCT` (100) with a small target
+  to `GO_MIN_PCT` as it grows to `FULL_PX`, shedding `STEER_K` of the inner
   wheel's duty per column the centroid sits off boresight. Image columns
   run mirrored to the drive sign (field tested); the sign in the code is
-  right. Target at `FULL_PX` or more = stand still until it backs off. No
-  target = stand still (never charge blind at full duty), and after
-  `LOST_TICKS` of that, `SCAN`.
+  right. Target at `FULL_PX` or more = stand still (`close`) until it
+  shrinks by `FULL_HYST_PX`. No target = stand still (never charge blind),
+  and after `LOST_TICKS` of that, `SCAN`. Motors commanded but pack
+  current over `STALL_MA` for `STALL_TICKS` = he's pushing on something:
+  a tag, `BACK`. `STALL_MA` is a guess until measured with the console.
+- `BACK`: reverse at `BACK_PCT` for `BACK_MS`, violet, then `TURN`.
+- `TURN`: spin at `TURN_PCT` through a random `TURN_MIN_DEG`..`TURN_MAX_DEG`,
+  gyro-metered with `TURN_TIMEOUT_S` as the backstop, then `SCAN`.
 
 Thresholds carry comments citing measured logs (`gestures.log`,
 `quiet_room_sat.log`, cal runs) from the old firmware; the numbers are

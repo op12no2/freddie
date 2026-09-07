@@ -4,8 +4,10 @@
  *
  * The whole behaviour: spin on the spot, slowing as warmth crosses the
  * view; when something warm sits near the middle of the frame, chase it,
- * flat out, steering on its centroid; stand still when it's right at his
- * wheels; lose it and spin again. A game of tag. Nothing else.
+ * flat out at first and easing off as it grows, steering on its centroid;
+ * stand still when it's right at his wheels; push against something and
+ * that's a tag — back off, turn away, spin again; lose it and spin again.
+ * A game of tag. Nothing else.
  *
  * A serial console (idf.py monitor, '?' for help) shows the thermal
  * frame for tuning; it's for the bench, not the behaviour. */
@@ -43,6 +45,7 @@
 #define LSM_REG_WHOAMI   0x0F  /* reads 0x6C */
 #define LSM_REG_CTRL1_XL 0x10  /* 0x40 = accel 104 Hz, ±2 g */
 #define LSM_REG_CTRL2_G  0x11  /* 0x44 = gyro 104 Hz, ±500 dps */
+#define LSM_REG_OUTX_L_G 0x22  /* 12 bytes: gyro xyz then accel xyz, LE */
 
 /* Deliberately scrambled vs the DRV8833 pin names: the A channel is
  * soldered to the right motor and B to the left, and both motors have
@@ -63,10 +66,12 @@
 #define RGB_GPIO        38     /* DevKitC-1 v1.1 onboard WS2812; v1.0 boards use 48 */
 
 /* Status colours, dim enough to look at — the LED is blinding at full duty.
- * Red = booting or a check failed, green = scanning, blue = following. */
+ * Red = booting or a check failed, green = scanning, blue = following,
+ * violet = tagged. */
 #define RGB_RED         32, 0, 0
 #define RGB_GREEN       0, 32, 0
 #define RGB_BLUE        0, 0, 48
+#define RGB_TAG         48, 0, 48
 
 #define RUN_LED_GPIO    11     /* discrete orange LED, 1 kOhm to GND, on the
                                   shelf: lit whenever he's running */
@@ -185,8 +190,6 @@ static esp_err_t ina_read(float *volts, float *milliamps)
     return ESP_OK;
 }
 
-/* The IMU isn't used by the behaviour; it's initialised so the boot
- * check proves the whole bus, and so it's ready when it's wanted. */
 static void lsm_init(void)
 {
     lsm = i2c_add(LSM_I2C_ADDR);
@@ -200,6 +203,22 @@ static void lsm_init(void)
         return;
     }
     lsm_ok = true;
+}
+
+/* Gyro in degrees/s and accel in g, both x/y/z. */
+static esp_err_t lsm_read(float dps[3], float g[3])
+{
+    uint8_t reg = LSM_REG_OUTX_L_G;
+    uint8_t raw[12];
+    esp_err_t err = i2c_master_transmit_receive(lsm, &reg, 1, raw, sizeof(raw), 100);
+    if (err != ESP_OK) {
+        return err;
+    }
+    for (int i = 0; i < 3; i++) {
+        dps[i] = (int16_t)(raw[2 * i] | (raw[2 * i + 1] << 8)) * 0.0175f;      /* 17.5 mdps/LSB at ±500 dps */
+        g[i] = (int16_t)(raw[6 + 2 * i] | (raw[7 + 2 * i] << 8)) * 0.000061f;  /* 0.061 mg/LSB at ±2 g */
+    }
+    return ESP_OK;
 }
 
 static rmt_channel_handle_t rgb_chan;
@@ -314,6 +333,10 @@ static void motors_init(void)
     gpio_set_level(DRV_SLP_GPIO, 0);   /* asleep until the first move */
 }
 
+/* The pack, as last read by the tick. */
+static float pack_v, pack_ma;
+static bool pack_ok;
+
 /* True when the pack is supplying current. With the pack off and USB in,
  * the 6V rail is back-fed through the DevKit's diode and the pack shunt
  * carries nothing — running motors then would pull amps through that
@@ -322,11 +345,10 @@ static void motors_init(void)
  * near-zero shunt reading means USB only. */
 static bool pack_live(void)
 {
-    float volts, ma;
-    if (!ina_ok || ina_read(&volts, &ma) != ESP_OK) {
+    if (!pack_ok) {
         return true;   /* can't tell — assume the pack is on */
     }
-    return ma > 20.0f;
+    return pack_ma > 20.0f;
 }
 
 /* No two TT motors are matched: the trim is added to the left duty
@@ -335,8 +357,13 @@ static bool pack_live(void)
  * 49/50 drive straight. */
 #define DRIVE_TRIM_PCT  -1
 
+static int cmd_left, cmd_right;   /* commanded duties, so the stall check
+                                     knows when he's meant to be moving */
+
 static void drive(int left_pct, int right_pct)
 {
+    cmd_left = left_pct;
+    cmd_right = right_pct;
     if (left_pct != 0 && right_pct != 0) {
         left_pct += (left_pct > 0) ? DRIVE_TRIM_PCT : -DRIVE_TRIM_PCT;
     }
@@ -372,21 +399,45 @@ static void drive(int left_pct, int right_pct)
 #define CENTER_COL     3.2f   /* boresight column (measured) */
 #define LOCK_COLS      1.0f   /* blob this near boresight during the scan:
                                  go for it */
-#define GO_PCT         100    /* follow duty: it's a chase */
+#define GO_PCT         100    /* follow duty with the target small: a chase */
+#define GO_MIN_PCT     30     /* ...easing to this as it grows to FULL_PX, so
+                                 he arrives at a walk, not a sprint */
 #define STEER_K        25.0f  /* inner-wheel duty shed per column the
                                  target sits off boresight */
 #define FULL_PX        24     /* the target this big = right at his wheels:
                                  stand still until it backs off (1 m from a
                                  crouching child fills 14 px, gestures.log) */
+#define FULL_HYST_PX   4      /* it must shrink this much below FULL_PX
+                                 before he moves again: no jackhammering
+                                 at shins over a flickering pixel */
 #define LOST_TICKS     10     /* stand still this long without the target,
                                  then look around */
+#define STALL_MA       900.0f /* pack current with the motors commanded =
+                                 pushing on something (feet, wall). A GUESS:
+                                 measure with the console, 's' while he
+                                 chases and again while you hold him back,
+                                 and put the number between them here */
+#define STALL_TICKS    3      /* sustained: launch inrush is a tick or so */
+#define BACK_PCT       60     /* tagged: reverse... */
+#define BACK_MS        400
+#define TURN_PCT       60     /* ...and about-face, gyro-metered, to a
+                                 random heading in this range */
+#define TURN_MIN_DEG   120
+#define TURN_MAX_DEG   240
+#define TURN_TIMEOUT_S 3      /* gyro trouble: don't pirouette forever */
 
-typedef enum { SCAN, FOLLOW } state_t;
+typedef enum { SCAN, FOLLOW, BACK, TURN } state_t;
 
 static state_t state;
 static int scan_sign;      /* spin direction this scan */
 static int lost;           /* consecutive ticks without the target */
 static int locking;        /* consecutive ticks with a target near boresight */
+static bool close;         /* at his wheels: standing still until it backs off */
+static int stalled;        /* consecutive ticks pushing on something */
+static int ticks_left;     /* back-off remaining, or turn timeout */
+static float turn_deg;     /* the about-face: degrees wanted... */
+static float turn_yaw;     /* ...and turned so far */
+static int turn_sign;
 
 /* For the console: the latest frame. */
 static float last_t[64];
@@ -442,6 +493,8 @@ static void enter(state_t s)
     state = s;
     lost = 0;
     locking = 0;
+    stalled = 0;
+    close = false;
     switch (s) {
     case SCAN:
         scan_sign = (esp_random() & 1) ? 1 : -1;
@@ -449,6 +502,18 @@ static void enter(state_t s)
         break;
     case FOLLOW:
         rgb_set(RGB_BLUE);
+        break;
+    case BACK:
+        ticks_left = BACK_MS * TICK_HZ / 1000;
+        drive(-BACK_PCT, -BACK_PCT);
+        rgb_set(RGB_TAG);
+        break;
+    case TURN:
+        turn_deg = TURN_MIN_DEG + esp_random() % (TURN_MAX_DEG - TURN_MIN_DEG + 1);
+        turn_yaw = 0;
+        turn_sign = (esp_random() & 1) ? 1 : -1;
+        ticks_left = TURN_TIMEOUT_S * TICK_HZ;
+        drive(turn_sign * TURN_PCT, -turn_sign * TURN_PCT);
         break;
     }
 }
@@ -458,7 +523,8 @@ static int clamp_pct(int pct)
     return pct < 0 ? 0 : pct > 100 ? 100 : pct;
 }
 
-/* One 10 Hz heartbeat: read the camera, step the behaviour. */
+/* One 10 Hz heartbeat: read the camera, the pack and the gyro, step the
+ * behaviour. */
 static void tick_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(SETTLE_S * 1000));
@@ -467,6 +533,10 @@ static void tick_task(void *arg)
     while (1) {
         xTaskDelayUntil(&wake, pdMS_TO_TICKS(1000 / TICK_HZ));
         int16_t px[64];
+        float dps[3] = { 0 }, g[3];
+        pack_ok = ina_ok && ina_read(&pack_v, &pack_ma) == ESP_OK;
+        lsm_read(dps, g);   /* a failed read counts no yaw; the turn
+                               timeout covers it */
         if (amg_read_pixels(px) != ESP_OK) {
             drive(0, 0);   /* blind: don't move */
             continue;
@@ -507,6 +577,15 @@ static void tick_task(void *arg)
             break;
         }
         case FOLLOW: {
+            /* tag: commanded moving but the pack says he's pushing on
+             * something — feet, usually */
+            bool pushing = pack_ok && (cmd_left != 0 || cmd_right != 0) &&
+                           pack_ma > STALL_MA;
+            stalled = pushing ? stalled + 1 : 0;
+            if (stalled >= STALL_TICKS) {
+                enter(BACK);
+                break;
+            }
             if (n == 0) {
                 drive(0, 0);   /* don't charge blind at full duty */
                 if (++lost >= LOST_TICKS) {
@@ -516,15 +595,37 @@ static void tick_task(void *arg)
             }
             lost = 0;
             if (n >= FULL_PX) {
+                close = true;
+            } else if (n < FULL_PX - FULL_HYST_PX) {
+                close = false;
+            }
+            if (close) {
                 drive(0, 0);   /* caught up: wait for them to move */
                 break;
             }
+            /* ease off as the target grows: flat out at a distance, a
+             * walk by the time it's nearly at his wheels */
+            int base = GO_PCT - (GO_PCT - GO_MIN_PCT) * n / FULL_PX;
             /* sign field-tested: image columns run mirrored, so a
              * centroid right of boresight means the target is to his
              * left — shed the left wheel */
             int turn = (int)(STEER_K * (col - CENTER_COL));
-            drive(clamp_pct(GO_PCT - (turn > 0 ? turn : 0)),
-                  clamp_pct(GO_PCT + (turn < 0 ? turn : 0)));
+            drive(clamp_pct(base - (turn > 0 ? turn : 0)),
+                  clamp_pct(base + (turn < 0 ? turn : 0)));
+            break;
+        }
+        case BACK: {
+            if (--ticks_left <= 0) {
+                enter(TURN);
+            }
+            break;
+        }
+        case TURN: {
+            turn_yaw += dps[2] * (1.0f / TICK_HZ);
+            if (fabsf(turn_yaw) >= turn_deg || --ticks_left <= 0) {
+                drive(0, 0);
+                enter(SCAN);
+            }
             break;
         }
         }
@@ -536,6 +637,8 @@ static const char *state_name(void)
     switch (state) {
     case SCAN: return "scan";
     case FOLLOW: return "follow";
+    case BACK: return "back";
+    case TURN: return "turn";
     }
     return "?";
 }
@@ -570,7 +673,8 @@ static void print_frame(void)
         printf("  col %.2f (off %+.2f)%s", col, col - CENTER_COL,
                n >= FULL_PX ? "  FULL" : "");
     }
-    printf("\n");
+    printf("\n  pack %.2f V %.0f mA  motors %d/%d\n", pack_v, pack_ma,
+           cmd_left, cmd_right);
 }
 
 static void print_help(void)
