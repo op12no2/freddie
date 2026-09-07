@@ -2,10 +2,11 @@
  * INA219 power monitor on one I2C bus, DRV8833 motors, and the DevKit's
  * onboard RGB status LED.
  *
- * The whole behaviour: spin on the spot, slowing as warmth crosses the
- * view; when something warm sits near the middle of the frame, drive at
- * it, steering on its centroid, until it fills the frame; sit there while
- * it does; lose it and spin again. Nothing else. */
+ * The whole behaviour: spin one circle on the spot, slowing as warmth
+ * crosses the view, then rest half a minute and spin again; when something
+ * warm sits near the middle of the frame, drive at it, steering on its
+ * centroid, until it fills the frame; sit there while it does; lose it
+ * and go back to the circling. Nothing else. */
 
 #include <math.h>
 #include <stdlib.h>
@@ -38,6 +39,7 @@
 #define LSM_REG_WHOAMI   0x0F  /* reads 0x6C */
 #define LSM_REG_CTRL1_XL 0x10  /* 0x40 = accel 104 Hz, ±2 g */
 #define LSM_REG_CTRL2_G  0x11  /* 0x44 = gyro 104 Hz, ±500 dps */
+#define LSM_REG_OUTX_L_G 0x22  /* 12 bytes: gyro xyz then accel xyz, LE */
 
 /* Deliberately scrambled vs the DRV8833 pin names: the A channel is
  * soldered to the right motor and B to the left, and both motors have
@@ -58,10 +60,11 @@
 #define RGB_GPIO        38     /* DevKitC-1 v1.1 onboard WS2812; v1.0 boards use 48 */
 
 /* Status colours, dim enough to look at — the LED is blinding at full duty.
- * Red = booting or a check failed, green = scanning, blue = going for
- * something, amber = arrived. */
+ * Red = booting or a check failed, green = scanning (an ember of it
+ * between scans), blue = going for something, amber = arrived. */
 #define RGB_RED         32, 0, 0
 #define RGB_GREEN       0, 32, 0
+#define RGB_GREEN_DIM   0, 5, 0
 #define RGB_BLUE        0, 0, 48
 #define RGB_AMBER       48, 24, 0
 
@@ -182,9 +185,6 @@ static esp_err_t ina_read(float *volts, float *milliamps)
     return ESP_OK;
 }
 
-/* The IMU is unused by the behaviour for now; it's initialised so the
- * boot check still proves the whole bus, and so it's ready when it's
- * wanted again. */
 static void lsm_init(void)
 {
     lsm = i2c_add(LSM_I2C_ADDR);
@@ -198,6 +198,22 @@ static void lsm_init(void)
         return;
     }
     lsm_ok = true;
+}
+
+/* Gyro in degrees/s and accel in g, both x/y/z. */
+static esp_err_t lsm_read(float dps[3], float g[3])
+{
+    uint8_t reg = LSM_REG_OUTX_L_G;
+    uint8_t raw[12];
+    esp_err_t err = i2c_master_transmit_receive(lsm, &reg, 1, raw, sizeof(raw), 100);
+    if (err != ESP_OK) {
+        return err;
+    }
+    for (int i = 0; i < 3; i++) {
+        dps[i] = (int16_t)(raw[2 * i] | (raw[2 * i + 1] << 8)) * 0.0175f;      /* 17.5 mdps/LSB at ±500 dps */
+        g[i] = (int16_t)(raw[6 + 2 * i] | (raw[7 + 2 * i] << 8)) * 0.000061f;  /* 0.061 mg/LSB at ±2 g */
+    }
+    return ESP_OK;
 }
 
 static rmt_channel_handle_t rgb_chan;
@@ -354,6 +370,9 @@ static void drive(int left_pct, int right_pct)
  * machinery is gone. */
 #define TICK_HZ        10     /* the sensor/behaviour heartbeat */
 #define SPIN_PCT       20     /* scan duty (pre-remap) */
+#define SCAN_TURN_DEG  360.0f /* one gyro-metered circle per scan */
+#define SCAN_TIMEOUT_S 30     /* gyro trouble: don't pirouette forever */
+#define REST_S         30     /* still, between scans */
 #define SPIN_MIN_PCT   1      /* gaze-drag floor: linger, never stall */
 #define GAZE_K         8.0f   /* duty shed per C of passing warmth */
 #define GAZE_DEAD_C    0.8f   /* scene contrast to ignore (empty-room
@@ -374,10 +393,12 @@ static void drive(int left_pct, int right_pct)
                                  before he follows again */
 #define LOST_TICKS     10     /* a second without the target = gone */
 
-typedef enum { SCAN, APPROACH, ARRIVED } state_t;
+typedef enum { SCAN, REST, APPROACH, ARRIVED } state_t;
 
 static state_t state;
 static int scan_sign;      /* spin direction this scan */
+static float scan_yaw;     /* degrees turned this scan */
+static int ticks_left;     /* scan timeout, or rest remaining */
 static float ambient;      /* frozen reference the target is measured
                               against while approaching — the frame mean
                               can't serve, a target that fills the frame
@@ -424,7 +445,14 @@ static void enter(state_t s)
     switch (s) {
     case SCAN:
         scan_sign = (esp_random() & 1) ? 1 : -1;
+        scan_yaw = 0;
+        ticks_left = SCAN_TIMEOUT_S * TICK_HZ;
         rgb_set(RGB_GREEN);
+        break;
+    case REST:
+        drive(0, 0);
+        ticks_left = REST_S * TICK_HZ;
+        rgb_set(RGB_GREEN_DIM);
         break;
     case APPROACH:
         rgb_set(RGB_BLUE);
@@ -441,7 +469,13 @@ static int clamp_pct(int pct)
     return pct < 0 ? 0 : pct > 100 ? 100 : pct;
 }
 
-/* One 10 Hz heartbeat: read the camera, step the behaviour. */
+/* A warm blob sitting near boresight: the thing he goes for. */
+static bool locked(const float t[64], float mean, float *col)
+{
+    return blob(t, mean, col) > 0 && fabsf(*col - CENTER_COL) <= LOCK_COLS;
+}
+
+/* One 10 Hz heartbeat: read the camera and gyro, step the behaviour. */
 static void tick_task(void *arg)
 {
     TickType_t wake = xTaskGetTickCount();
@@ -449,10 +483,13 @@ static void tick_task(void *arg)
     while (1) {
         xTaskDelayUntil(&wake, pdMS_TO_TICKS(1000 / TICK_HZ));
         int16_t px[64];
+        float dps[3] = { 0 }, g[3];
         if (amg_read_pixels(px) != ESP_OK) {
             drive(0, 0);   /* blind: don't move */
             continue;
         }
+        lsm_read(dps, g);   /* a failed read counts no yaw; the scan
+                               timeout covers it */
         float t[64], maxt = -100, sum = 0, col = CENTER_COL;
         for (int i = 0; i < 64; i++) {
             t[i] = px[i] * 0.25f;
@@ -475,10 +512,27 @@ static void tick_task(void *arg)
                 duty = SPIN_MIN_PCT;
             }
             drive(scan_sign * duty, -scan_sign * duty);
-            if (blob(t, mean, &col) > 0 &&
-                fabsf(col - CENTER_COL) <= LOCK_COLS) {
+            if (locked(t, mean, &col)) {
                 ambient = ambient_of(t, mean);
                 enter(APPROACH);
+                break;
+            }
+            scan_yaw += dps[2] * (1.0f / TICK_HZ);
+            if (fabsf(scan_yaw) >= SCAN_TURN_DEG || --ticks_left <= 0) {
+                enter(REST);   /* circle done, nothing doing */
+            }
+            break;
+        }
+        case REST: {
+            /* still, but not blind: something warm walking up to him
+             * mid-rest gets the same welcome as it would mid-scan */
+            if (locked(t, mean, &col)) {
+                ambient = ambient_of(t, mean);
+                enter(APPROACH);
+                break;
+            }
+            if (--ticks_left <= 0) {
+                enter(SCAN);
             }
             break;
         }

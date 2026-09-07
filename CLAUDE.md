@@ -6,10 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Firmware for Freddie, an autonomous ESP32-S3 robot (see README.md for the
 parts list). He watches the room through an 8x8 thermal camera and does one
-thing: spin on the spot, slowing as warmth crosses his view; when something
-warm sits near the middle of the frame, drive at it, steering on its
-centroid, until it fills the frame; sit there while it does; lose it and
-spin again. The firmware is fully autonomous and deliberately minimal:
+thing: spin one circle on the spot, slowing as warmth crosses his view,
+then rest half a minute and spin again; when something warm sits near the
+middle of the frame, drive at it, steering on its centroid, until it fills
+the frame; sit there while it does; lose it and go back to circling. The firmware is fully autonomous and deliberately minimal:
 there is no console, no radio, no logging — the LEDs are his whole
 interface.
 
@@ -42,10 +42,10 @@ workflow.
 
 **Peripherals**, all initialized in `app_main()`:
 - AMG8833 thermal camera, INA219 power/current monitor, LSM6DSOX IMU — all
-  on one I2C bus (`i2c_init`, then per-device `*_init`). Only the camera is
-  read by the behaviour. The INA219 backs `pack_live()`, which refuses to
-  drive the motors on USB power alone. The IMU is initialised for the boot
-  check only and otherwise unused for now.
+  on one I2C bus (`i2c_init`, then per-device `*_init`/`*_read`). The
+  camera drives the behaviour; the gyro Z axis meters the scan's circle;
+  the INA219 backs `pack_live()`, which refuses to drive the motors on USB
+  power alone.
 - DRV8833 dual motor driver via LEDC PWM (`motors_init`, `motor_set`,
   `drive`). Note the wiring is physically crossed and inverted versus the
   DRV8833's own pin names — this is corrected once in the `MOTOR_*_GPIO`
@@ -53,13 +53,14 @@ workflow.
   sane; don't "fix" the apparent crossing there.
 - Onboard WS2812 RGB status LED via RMT (`rgb_init`/`rgb_set`). Colour
   meanings are the `RGB_*` macros: red = booting/failed check, green =
-  scanning, blue = approaching, amber = arrived.
+  scanning (dim green = resting between scans), blue = approaching, amber =
+  arrived.
 - A discrete GPIO LED (`WAKE_LED_GPIO`) is lit whenever the checks passed
   and he's running.
 
 **Concurrency model**: one FreeRTOS task, `tick_task`, at `TICK_HZ`
-(10 Hz). Each tick it reads the thermal frame and steps a three-state
-machine (`state_t`: `SCAN`, `APPROACH`, `ARRIVED`). `app_main()`
+(10 Hz). Each tick it reads the thermal frame and the IMU and steps a
+four-state machine (`state_t`: `SCAN`, `REST`, `APPROACH`, `ARRIVED`). `app_main()`
 initialises the peripherals and, if every check passed, starts the task.
 
 **The behaviour**:
@@ -70,7 +71,11 @@ initialises the peripherals and, if every check passed, starts the task.
   fiddle with it. When a blob (`blob()`: pixels `BLOB_C` over the frame
   mean, at least `BLOB_MIN_PX` of them) has its centroid within
   `LOCK_COLS` of boresight (`CENTER_COL`), freeze the non-blob mean as
-  `ambient` and enter `APPROACH`.
+  `ambient` and enter `APPROACH`. The circle is gyro-metered
+  (`SCAN_TURN_DEG`, with `SCAN_TIMEOUT_S` as the backstop); a circle that
+  locks nothing ends in `REST`.
+- `REST`: motors off for `REST_S`, dim green. Not blind: the same lock
+  check runs, so something warm walking up mid-rest gets approached.
 - `APPROACH`: drive at `GO_PCT`, steering by `STEER_K` per column the blob
   centroid sits off boresight. The blob is measured against the frozen
   `ambient`, not the live frame mean, because a target that fills the
