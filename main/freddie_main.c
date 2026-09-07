@@ -414,6 +414,16 @@ static void drive(int left_pct, int right_pct)
                                  chases and again while you hold him back,
                                  and put the number between them here */
 #define STALL_TICKS    3      /* sustained: launch inrush is a tick or so */
+#define BUMP_K         3.0f   /* a bump: horizontal accel this many times
+                                 its running average while driving (the
+                                 floor's own bumps set the average)... */
+#define BUMP_MIN_G     0.25f  /* ...and at least this far over it, so a
+                                 smooth floor can't make a knock of nothing.
+                                 Launch vibration ran p99 0.24 g at 10 Hz
+                                 on the old sprint logs */
+#define BUMP_ARM_TICKS 5      /* driving this long before bumps count:
+                                 the launch is a jolt of its own */
+#define BUMP_AVG_ALPHA 0.1f
 #define BACK_PCT       60     /* tagged: reverse... */
 #define BACK_MS        400
 #define TURN_PCT       60     /* ...and about-face, gyro-metered, to a
@@ -432,13 +442,16 @@ static int scan_hint;      /* which way the target last went, as a spin
 static int lost;           /* consecutive ticks without the target */
 static int locking;        /* consecutive ticks with a target near boresight */
 static int stalled;        /* consecutive ticks pushing on something */
+static int moving;         /* consecutive ticks commanded moving */
+static float accel_avg;    /* running horizontal accel while driving */
 static int ticks_left;     /* back-off remaining, or turn timeout */
 static float turn_deg;     /* the about-face: degrees wanted... */
 static float turn_yaw;     /* ...and turned so far */
 static int turn_sign;
 
-/* For the console: the latest frame. */
+/* For the console: the latest frame and accel. */
 static float last_t[64];
+static float last_g[3];
 static volatile bool frozen;   /* console 'x': sense, but don't move */
 
 static int cmp_float(const void *a, const void *b)
@@ -492,6 +505,7 @@ static void enter(state_t s)
     lost = 0;
     locking = 0;
     stalled = 0;
+    moving = 0;
     switch (s) {
     case SCAN:
         if (scan_hint) {
@@ -544,8 +558,13 @@ static void tick_task(void *arg)
         int16_t px[64];
         float dps[3] = { 0 }, g[3];
         pack_ok = ina_ok && ina_read(&pack_v, &pack_ma) == ESP_OK;
-        lsm_read(dps, g);   /* a failed read counts no yaw; the turn
-                               timeout covers it */
+        if (lsm_read(dps, g) != ESP_OK) {
+            dps[2] = 0;   /* no yaw this tick; the turn timeout covers it */
+            g[0] = g[1] = 0;
+        }
+        for (int i = 0; i < 3; i++) {
+            last_g[i] = g[i];
+        }
         if (amg_read_pixels(px) != ESP_OK) {
             drive(0, 0);   /* blind: don't move */
             continue;
@@ -572,14 +591,28 @@ static void tick_task(void *arg)
             break;
         }
         case FOLLOW: {
-            /* tag: commanded moving but the pack says he's pushing on
-             * something — feet, usually */
-            bool pushing = pack_ok && (cmd_left != 0 || cmd_right != 0) &&
-                           pack_ma > STALL_MA;
+            /* tag, two ways: commanded moving but the pack says he's
+             * pushing on something (feet, usually), or the accelerometer
+             * says he just hit something */
+            bool commanded = cmd_left != 0 || cmd_right != 0;
+            moving = commanded ? moving + 1 : 0;
+            bool pushing = pack_ok && commanded && pack_ma > STALL_MA;
             stalled = pushing ? stalled + 1 : 0;
             if (stalled >= STALL_TICKS) {
                 enter(BACK);
                 break;
+            }
+            float accel = sqrtf(g[0] * g[0] + g[1] * g[1]);
+            if (moving >= BUMP_ARM_TICKS) {
+                if (accel_avg == 0) {
+                    accel_avg = accel;
+                }
+                if (accel > BUMP_K * accel_avg &&
+                    accel - accel_avg > BUMP_MIN_G) {
+                    enter(BACK);
+                    break;
+                }
+                accel_avg += BUMP_AVG_ALPHA * (accel - accel_avg);
             }
             if (n == 0) {
                 drive(0, 0);   /* don't charge blind at full duty */
@@ -658,8 +691,9 @@ static void print_frame(void)
     if (n > 0) {
         printf("  col %.2f (off %+.2f)", col, col - CENTER_COL);
     }
-    printf("\n  pack %.2f V %.0f mA  motors %d/%d\n", pack_v, pack_ma,
-           cmd_left, cmd_right);
+    printf("\n  pack %.2f V %.0f mA  motors %d/%d  accel %.2f g (avg %.2f)\n",
+           pack_v, pack_ma, cmd_left, cmd_right,
+           sqrtf(last_g[0] * last_g[0] + last_g[1] * last_g[1]), accel_avg);
 }
 
 static void print_help(void)

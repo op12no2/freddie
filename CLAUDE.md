@@ -16,7 +16,8 @@ radio, no logging — the LEDs are his whole interface. There is a small
 serial console for the bench (`idf.py monitor`, `?` for help): `p` prints
 the thermal frame with target pixels starred, `s` streams it, `x` freezes
 the motors while sensing continues. The status line carries pack volts
-and mA and the commanded duties, for setting `STALL_MA`. It's for tuning thresholds, not part
+and mA, the commanded duties, and horizontal accel with its running
+average, for setting `STALL_MA` and the `BUMP_*` knobs. It's for tuning thresholds, not part
 of the behaviour.
 
 This is a deliberate reset. An earlier, much richer firmware (sleep/wake
@@ -49,10 +50,11 @@ workflow.
 **Peripherals**, all initialized in `app_main()`:
 - AMG8833 thermal camera, INA219 power/current monitor, LSM6DSOX IMU — all
   on one I2C bus (`i2c_init`, then per-device `*_init`/`*_read`). The
-  camera drives the behaviour; the INA219's pack current is the tag
+  camera drives the behaviour; the INA219's pack current is one tag
   sensor (a stall reads as a push) and backs `pack_live()`, which refuses
-  to drive the motors on USB power alone; the gyro Z axis meters the
-  turn-away after a tag.
+  to drive the motors on USB power alone; the accelerometer is the other
+  (a jolt reads as a hit); the gyro Z axis meters the turn-away after a
+  tag.
 - DRV8833 dual motor driver via LEDC PWM (`motors_init`, `motor_set`,
   `drive`). Note the wiring is physically crossed and inverted versus the
   DRV8833's own pin names — this is corrected once in the `MOTOR_*_GPIO`
@@ -101,7 +103,11 @@ the tick honours by stopping the motors and skipping the state machine.
   from the scene, so it vanishes. Motors commanded but pack current over
   `STALL_MA` for `STALL_TICKS` = he's pushing on something: a tag, `BACK`.
   `STALL_MA` has to sit high or launches on carpet trip it; a missed tag
-  is harmless, he just loses them and scans.
+  is harmless, he just loses them and scans. Likewise horizontal accel
+  over `BUMP_K` times its running average (`accel_avg`, learned while
+  driving, so the floor's own bumps raise the bar) and at least
+  `BUMP_MIN_G` above it = he hit something: `BACK`. Not armed until
+  `BUMP_ARM_TICKS` into a drive, because the launch is a jolt.
 - `BACK`: reverse at `BACK_PCT` for `BACK_MS`, violet, then `TURN`.
 - `TURN`: spin at `TURN_PCT` through a random `TURN_MIN_DEG`..`TURN_MAX_DEG`,
   gyro-metered with `TURN_TIMEOUT_S` as the backstop, then `SCAN`.
