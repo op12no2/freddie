@@ -408,12 +408,15 @@ static void drive(int left_pct, int right_pct)
                                  target sits off boresight */
 #define LOST_TICKS     10     /* stand still this long without the target,
                                  then look around */
-#define STALL_MA       600.0f /* pack current with the motors commanded =
-                                 pushing on something (feet, wall). A GUESS:
-                                 measure with the console, 's' while he
-                                 chases and again while you hold him back,
-                                 and put the number between them here */
-#define STALL_TICKS    3      /* sustained: launch inrush is a tick or so */
+#define ARM_TICKS      5      /* driving this long before stalls and bumps
+                                 count, and before the averages learn: the
+                                 launch is a surge and a jolt of its own */
+#define AVG_ALPHA      0.1f   /* running-average rate, current and accel */
+#define STALL_K        2.0f   /* a stall: pack current this many times its
+                                 running average while driving (the floor
+                                 sets the average: carpet draws more)... */
+#define STALL_MIN_MA   300.0f /* ...and at least this far over it */
+#define STALL_TICKS    3      /* sustained, unlike a bump */
 #define BUMP_K         3.0f   /* a bump: horizontal accel this many times
                                  its running average while driving (the
                                  floor's own bumps set the average)... */
@@ -421,9 +424,6 @@ static void drive(int left_pct, int right_pct)
                                  smooth floor can't make a knock of nothing.
                                  Launch vibration ran p99 0.24 g at 10 Hz
                                  on the old sprint logs */
-#define BUMP_ARM_TICKS 5      /* driving this long before bumps count:
-                                 the launch is a jolt of its own */
-#define BUMP_AVG_ALPHA 0.1f
 #define BACK_PCT       60     /* tagged: reverse... */
 #define BACK_MS        400
 #define TURN_PCT       60     /* ...and about-face, gyro-metered, to a
@@ -444,6 +444,7 @@ static int locking;        /* consecutive ticks with a target near boresight */
 static int stalled;        /* consecutive ticks pushing on something */
 static int moving;         /* consecutive ticks commanded moving */
 static float accel_avg;    /* running horizontal accel while driving */
+static float ma_avg;       /* running pack current while driving */
 static int ticks_left;     /* back-off remaining, or turn timeout */
 static float turn_deg;     /* the about-face: degrees wanted... */
 static float turn_yaw;     /* ...and turned so far */
@@ -596,23 +597,32 @@ static void tick_task(void *arg)
              * says he just hit something */
             bool commanded = cmd_left != 0 || cmd_right != 0;
             moving = commanded ? moving + 1 : 0;
-            bool pushing = pack_ok && commanded && pack_ma > STALL_MA;
-            stalled = pushing ? stalled + 1 : 0;
-            if (stalled >= STALL_TICKS) {
-                enter(BACK);
-                break;
-            }
             float accel = sqrtf(g[0] * g[0] + g[1] * g[1]);
-            if (moving >= BUMP_ARM_TICKS) {
+            if (moving >= ARM_TICKS) {
+                if (ma_avg == 0) {
+                    ma_avg = pack_ma;
+                }
                 if (accel_avg == 0) {
                     accel_avg = accel;
                 }
-                if (accel > BUMP_K * accel_avg &&
-                    accel - accel_avg > BUMP_MIN_G) {
+                bool pushing = pack_ok && pack_ma > STALL_K * ma_avg &&
+                               pack_ma - ma_avg > STALL_MIN_MA;
+                stalled = pushing ? stalled + 1 : 0;
+                if (stalled >= STALL_TICKS) {
                     enter(BACK);
                     break;
                 }
-                accel_avg += BUMP_AVG_ALPHA * (accel - accel_avg);
+                bool hit = accel > BUMP_K * accel_avg &&
+                           accel - accel_avg > BUMP_MIN_G;
+                if (hit) {
+                    enter(BACK);
+                    break;
+                }
+                /* the averages learn from ordinary driving only */
+                if (!pushing) {
+                    ma_avg += AVG_ALPHA * (pack_ma - ma_avg);
+                }
+                accel_avg += AVG_ALPHA * (accel - accel_avg);
             }
             if (n == 0) {
                 drive(0, 0);   /* don't charge blind at full duty */
@@ -691,8 +701,9 @@ static void print_frame(void)
     if (n > 0) {
         printf("  col %.2f (off %+.2f)", col, col - CENTER_COL);
     }
-    printf("\n  pack %.2f V %.0f mA  motors %d/%d  accel %.2f g (avg %.2f)\n",
-           pack_v, pack_ma, cmd_left, cmd_right,
+    printf("\n  pack %.2f V %.0f mA (avg %.0f)  motors %d/%d  "
+           "accel %.2f g (avg %.2f)\n",
+           pack_v, pack_ma, ma_avg, cmd_left, cmd_right,
            sqrtf(last_g[0] * last_g[0] + last_g[1] * last_g[1]), accel_avg);
 }
 

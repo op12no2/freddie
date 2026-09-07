@@ -17,7 +17,7 @@ serial console for the bench (`idf.py monitor`, `?` for help): `p` prints
 the thermal frame with target pixels starred, `s` streams it, `x` freezes
 the motors while sensing continues. The status line carries pack volts
 and mA, the commanded duties, and horizontal accel with its running
-average, for setting `STALL_MA` and the `BUMP_*` knobs. It's for tuning thresholds, not part
+average, for setting the `STALL_*` and `BUMP_*` knobs. It's for tuning thresholds, not part
 of the behaviour.
 
 This is a deliberate reset. An earlier, much richer firmware (sleep/wake
@@ -100,14 +100,16 @@ the tick honours by stopping the motors and skipping the state machine.
   right. No target = stand still (never charge blind), and after
   `LOST_TICKS` of that, `SCAN` — which is also how a chase ends up close:
   past half the frame the coldest-half ambient can't separate the target
-  from the scene, so it vanishes. Motors commanded but pack current over
-  `STALL_MA` for `STALL_TICKS` = he's pushing on something: a tag, `BACK`.
-  `STALL_MA` has to sit high or launches on carpet trip it; a missed tag
-  is harmless, he just loses them and scans. Likewise horizontal accel
-  over `BUMP_K` times its running average (`accel_avg`, learned while
-  driving, so the floor's own bumps raise the bar) and at least
-  `BUMP_MIN_G` above it = he hit something: `BACK`. Not armed until
-  `BUMP_ARM_TICKS` into a drive, because the launch is a jolt.
+  from the scene, so it vanishes. Two tag sensors, both judged
+  against running averages learned while driving (`ma_avg`, `accel_avg`,
+  rate `AVG_ALPHA`), so the floor sets the bar — carpet draws more and
+  bumps more — and neither is armed until `ARM_TICKS` into a drive,
+  because the launch is a surge and a jolt of its own. Pack current over
+  `STALL_K` times its average and at least `STALL_MIN_MA` above it, for
+  `STALL_TICKS` running = he's pushing on something. Horizontal accel
+  over `BUMP_K` times its average and at least `BUMP_MIN_G` above it, on
+  one tick = he hit something. Either = a tag, `BACK`. A missed tag is
+  harmless: he loses them and scans.
 - `BACK`: reverse at `BACK_PCT` for `BACK_MS`, violet, then `TURN`.
 - `TURN`: spin at `TURN_PCT` through a random `TURN_MIN_DEG`..`TURN_MAX_DEG`,
   gyro-metered with `TURN_TIMEOUT_S` as the backstop, then `SCAN`.
