@@ -85,9 +85,13 @@ stopping the motors and skipping the state machine.
 - `REST`: motors off for `REST_S`, dim green. Not blind: the same lock
   check runs, so something warm walking up mid-rest gets approached.
 - `APPROACH`: drive at `GO_PCT`, steering by `STEER_K` per column the blob
-  centroid sits off boresight. The blob is measured against the frozen
-  `ambient`, not the live frame mean, because a target that fills the
-  frame *is* the mean. Image columns run mirrored to the drive sign (field
+  centroid sits off boresight. The blob is measured against `ambient`, not
+  the live frame mean, because a target that fills the frame *is* the
+  mean. `ambient` is seeded from the non-blob mean at lock-on and then
+  eased toward the current non-blob mean (`ambient_track`, `AMBIENT_ALPHA`)
+  while at least half the frame is background (`AMBIENT_MAX_PX`); with the
+  target filling the frame it stays frozen. A stale ambient made the local
+  scene read as a target after the visitor left, which held him amber. Image columns run mirrored to the drive sign (field
   tested); the sign in the code is right. `arrived()` = the blob's nearest
   row has reached the floor line (`FLOOR_ROW`, row 0: the bottom of the
   frame, which a warm thing on the floor reaches at ~10 cm regardless of

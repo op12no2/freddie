@@ -408,6 +408,13 @@ static void drive(int left_pct, int right_pct)
 #define FILL_HYST_PX   8      /* it must shrink this much below FILL_PX
                                  before he follows again */
 #define LOST_TICKS     10     /* a second without the target = gone */
+#define AMBIENT_ALPHA  0.1f   /* ambient tracks the non-target pixels at
+                                 this rate while approaching, so the
+                                 reference is the scene he's looking at
+                                 now, not the one he locked on from */
+#define AMBIENT_MAX_PX 32     /* ...but only while at least half the frame
+                                 is background; a target filling the frame
+                                 can't drag the reference up after itself */
 
 typedef enum { SCAN, REST, APPROACH, ARRIVED } state_t;
 
@@ -415,10 +422,11 @@ static state_t state;
 static int scan_sign;      /* spin direction this scan */
 static float scan_yaw;     /* degrees turned this scan */
 static int ticks_left;     /* scan timeout, or rest remaining */
-static float ambient;      /* frozen reference the target is measured
-                              against while approaching — the frame mean
-                              can't serve, a target that fills the frame
-                              *is* the mean */
+static float ambient;      /* reference the target is measured against
+                              while approaching: the non-target mean,
+                              frozen whenever the target takes over the
+                              frame — the frame mean can't serve, a target
+                              that fills the frame *is* the mean */
 static int lost;           /* consecutive ticks without the target */
 
 /* For the console: the latest frame and what the behaviour made of it. */
@@ -466,17 +474,26 @@ static bool receded(int n, int near)
 }
 
 /* Mean of the pixels that aren't the blob: the scene minus the visitor. */
-static float ambient_of(const float t[64], float mean)
+static float ambient_of(const float t[64], float ref)
 {
     int n = 0;
     float sum = 0;
     for (int i = 0; i < 64; i++) {
-        if (t[i] - mean < BLOB_C) {
+        if (t[i] - ref < BLOB_C) {
             n++;
             sum += t[i];
         }
     }
-    return n > 0 ? sum / n : mean;
+    return n > 0 ? sum / n : ref;
+}
+
+/* Keep the ambient honest as he moves: ease it toward the current
+ * non-target mean while there's enough background in view to trust. */
+static void ambient_track(const float t[64], int n)
+{
+    if (n <= AMBIENT_MAX_PX) {
+        ambient += AMBIENT_ALPHA * (ambient_of(t, ambient) - ambient);
+    }
 }
 
 static void enter(state_t s)
@@ -588,6 +605,7 @@ static void tick_task(void *arg)
         case APPROACH: {
             int near;
             int n = blob(t, ambient, &col, &near);
+            ambient_track(t, n);
             if (n == 0) {
                 if (++lost >= LOST_TICKS) {
                     enter(SCAN);
@@ -610,6 +628,7 @@ static void tick_task(void *arg)
         case ARRIVED: {
             int near;
             int n = blob(t, ambient, &col, &near);
+            ambient_track(t, n);
             if (n == 0) {
                 if (++lost >= LOST_TICKS) {
                     enter(SCAN);
@@ -673,7 +692,7 @@ static void print_frame(void)
     }
     printf("  %s%s  mean %.2f  ref %.2f (%s)  blob %d px",
            state_name(), frozen ? " (frozen)" : "", mean, ref,
-           ref == mean ? "frame mean" : "frozen ambient", n);
+           ref == mean ? "frame mean" : "tracked ambient", n);
     if (n > 0) {
         printf("  col %.2f (off %+.2f)  rows %d..%d (centroid %.2f)%s",
                col, col - CENTER_COL, near, far, (float)rsum / n,
