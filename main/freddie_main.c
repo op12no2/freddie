@@ -406,7 +406,7 @@ static void drive(int left_pct, int right_pct)
                                  target sits off boresight */
 #define LOST_TICKS     10     /* stand still this long without the target,
                                  then look around */
-#define STALL_MA       900.0f /* pack current with the motors commanded =
+#define STALL_MA       600.0f /* pack current with the motors commanded =
                                  pushing on something (feet, wall). A GUESS:
                                  measure with the console, 's' while he
                                  chases and again while you hold him back,
