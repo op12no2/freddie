@@ -353,6 +353,11 @@ static void drive(int left_pct, int right_pct)
  * simplified; the numbers are load-bearing even though the recording
  * machinery is gone. */
 #define TICK_HZ        10     /* the sensor/behaviour heartbeat */
+#define SETTLE_S       2      /* still after boot while the camera's first
+                                 frames, which are junk, go by */
+#define LOCK_TICKS     3      /* the target must sit near boresight this
+                                 many ticks running before he goes: one
+                                 noisy frame can't launch him */
 #define SPIN_PCT       20     /* scan duty (pre-remap) */
 #define SPIN_MIN_PCT   1      /* gaze-drag floor: linger, never stall */
 #define GAZE_K         8.0f   /* duty shed per C of passing warmth */
@@ -379,6 +384,7 @@ typedef enum { SCAN, FOLLOW } state_t;
 static state_t state;
 static int scan_sign;      /* spin direction this scan */
 static int lost;           /* consecutive ticks without the target */
+static int locking;        /* consecutive ticks with a target near boresight */
 
 /* For the console: the latest frame. */
 static float last_t[64];
@@ -433,6 +439,7 @@ static void enter(state_t s)
 {
     state = s;
     lost = 0;
+    locking = 0;
     switch (s) {
     case SCAN:
         scan_sign = (esp_random() & 1) ? 1 : -1;
@@ -452,6 +459,7 @@ static int clamp_pct(int pct)
 /* One 10 Hz heartbeat: read the camera, step the behaviour. */
 static void tick_task(void *arg)
 {
+    vTaskDelay(pdMS_TO_TICKS(SETTLE_S * 1000));
     TickType_t wake = xTaskGetTickCount();
     enter(SCAN);
     while (1) {
@@ -489,7 +497,9 @@ static void tick_task(void *arg)
                 duty = SPIN_MIN_PCT;
             }
             drive(scan_sign * duty, -scan_sign * duty);
-            if (n > 0 && fabsf(col - CENTER_COL) <= LOCK_COLS) {
+            bool near = n > 0 && fabsf(col - CENTER_COL) <= LOCK_COLS;
+            locking = near ? locking + 1 : 0;
+            if (locking >= LOCK_TICKS) {
                 enter(FOLLOW);
             }
             break;
@@ -620,6 +630,7 @@ void app_main(void)
            ina_ok ? "ok" : "MISSING", lsm_ok ? "ok" : "MISSING");
     if (amg_ok && ina_ok && lsm_ok) {
         gpio_set_level(WAKE_LED_GPIO, 1);
+        rgb_set(RGB_GREEN);   /* checks passed; still while the camera settles */
         xTaskCreate(tick_task, "tick", 4096, NULL, 5, NULL);
     }
     console();   /* never returns */

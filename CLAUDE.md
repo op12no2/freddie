@@ -64,7 +64,9 @@ workflow.
 (10 Hz). Each tick it reads the thermal frame and steps a two-state
 machine (`state_t`: `SCAN`, `FOLLOW`). `app_main()` initialises the
 peripherals, starts the task if every check passed, then runs the console
-loop on UART0 forever. The tick task publishes its latest frame (`last_t`)
+loop on UART0 forever. The task holds still for `SETTLE_S` before its
+first scan: the AMG8833's first frames after reset are junk and once
+locked him onto a wall. The tick task publishes its latest frame (`last_t`)
 for the console's `print_frame`; the console's `x` sets `frozen`, which
 the tick honours by stopping the motors and skipping the state machine.
 
@@ -82,7 +84,7 @@ the tick honours by stopping the motors and skipping the state machine.
   so the gaze lingers on warmth. This slow-on-heat sweep is the one piece
   carried over unchanged from the old firmware; it works well, don't
   fiddle with it. Target centroid within `LOCK_COLS` of boresight
-  (`CENTER_COL`) = `FOLLOW`.
+  (`CENTER_COL`) for `LOCK_TICKS` running = `FOLLOW`.
 - `FOLLOW`: drive at `GO_PCT` (100), shedding `STEER_K` of the inner
   wheel's duty per column the centroid sits off boresight. Image columns
   run mirrored to the drive sign (field tested); the sign in the code is
