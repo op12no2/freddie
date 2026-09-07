@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Firmware for Freddie, an autonomous ESP32-S3 robot (see README.md for the
 parts list). He watches the room through an 8x8 thermal camera and plays
-tag: spin on the spot, slowing as warmth crosses his view; when something
-warm sits near the middle of the frame, chase it flat out, steering on its
+tag: spin on the spot; when something warm sits near the middle of the
+frame, chase it flat out, steering on its
 centroid, until he loses it or runs into it; either way look around again
 (a run-in earns a back-off and a turn away first). He does the tagging;
 getting out of his way is the game. There is deliberately no slowing or
@@ -83,11 +83,9 @@ the tick honours by stopping the motors and skipping the state machine.
   (The frame mean fails because a target that fills the frame *is* the
   mean; a reference frozen at lock-on, tried earlier, went stale by the
   time he'd crossed the room. Both are in git history.)
-- `SCAN`: spin at `SPIN_PCT`, shedding duty in proportion to the frame's
-  max-minus-mean contrast (`GAZE_K`, `GAZE_DEAD_C`, floor `SPIN_MIN_PCT`)
-  so the gaze lingers on warmth. This slow-on-heat sweep is the one piece
-  carried over unchanged from the old firmware; it works well, don't
-  fiddle with it. The spin direction holds for a streak of
+- `SCAN`: spin at `SPIN_PCT`, flat. (The old firmware's sweep slowed as
+  warmth crossed the view, a lovely lingering gaze; it's in git history,
+  dropped because the game wants frantic.) The spin direction holds for a streak of
   `SPIN_STREAK_MIN`..`SPIN_STREAK_MAX` scans, then flips: hide behind him
   and he keeps turning the same way, until he doesn't. Target centroid
   within `LOCK_COLS` of boresight (`CENTER_COL`) for `LOCK_TICKS` running

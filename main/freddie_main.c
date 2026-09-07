@@ -2,8 +2,8 @@
  * INA219 power monitor on one I2C bus, DRV8833 motors, and the DevKit's
  * onboard RGB status LED, and a discrete "running" LED on the shelf.
  *
- * The whole behaviour: spin on the spot, slowing as warmth crosses the
- * view; when something warm sits near the middle of the frame, chase it
+ * The whole behaviour: spin on the spot; when something warm sits near
+ * the middle of the frame, chase it
  * flat out, steering on its centroid, until he loses it or runs into it;
  * either way, look around again (a run-in earns a back-off and a turn
  * away first). He's the one doing the tagging; it's on you to get out of
@@ -392,10 +392,6 @@ static void drive(int left_pct, int right_pct)
                                  hide behind him and he keeps turning the
                                  same way, until he doesn't */
 #define SPIN_STREAK_MAX 5
-#define SPIN_MIN_PCT   1      /* gaze-drag floor: linger, never stall */
-#define GAZE_K         8.0f   /* duty shed per C of passing warmth */
-#define GAZE_DEAD_C    0.8f   /* scene contrast to ignore (empty-room
-                                 max-mean runs ~0.9-1.4, gestures.log) */
 #define BLOB_C         2.0f   /* px over ambient = part of the target: a
                                  standing person at 2 m clears the frame
                                  mean by +2.0-2.4 C (gestures.log) */
@@ -543,16 +539,11 @@ static void tick_task(void *arg)
             drive(0, 0);   /* blind: don't move */
             continue;
         }
-        float t[64], maxt = -100, sum = 0, col = CENTER_COL;
+        float t[64], col = CENTER_COL;
         for (int i = 0; i < 64; i++) {
             t[i] = px[i] * 0.25f;
             last_t[i] = t[i];
-            sum += t[i];
-            if (t[i] > maxt) {
-                maxt = t[i];
-            }
         }
-        float mean = sum / 64;
         int n = blob(t, ambient_of(t), &col);
         if (frozen) {
             drive(0, 0);
@@ -561,16 +552,7 @@ static void tick_task(void *arg)
 
         switch (state) {
         case SCAN: {
-            /* the gaze lingers: passing warmth sheds spin duty */
-            float drag = (maxt - mean) - GAZE_DEAD_C;
-            if (drag < 0) {
-                drag = 0;
-            }
-            int duty = SPIN_PCT - (int)(GAZE_K * drag);
-            if (duty < SPIN_MIN_PCT) {
-                duty = SPIN_MIN_PCT;
-            }
-            drive(scan_sign * duty, -scan_sign * duty);
+            drive(scan_sign * SPIN_PCT, -scan_sign * SPIN_PCT);
             bool near = n > 0 && fabsf(col - CENTER_COL) <= LOCK_COLS;
             locking = near ? locking + 1 : 0;
             if (locking >= LOCK_TICKS) {
