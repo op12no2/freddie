@@ -1,9 +1,14 @@
 # Freddie
 
-A little autonomous robot that plays tag: he spins on the spot watching
-the room through a thermal camera, slows as warmth crosses his view, and
-when someone's in the middle of it, chases them flat out until they're at
-his wheels or he loses them — then looks around again.
+A little autonomous robot that chases you. He spins on the spot looking through an 8x8 thermal camera then drives in your direction after detection. He can follow you through small changes in direction but if he loses you, he stops and looks around again etc.
+
+Freddie handles stalls and bumps by reversing out and spinning; looking.
+
+## LED
+
+- Green - spinning, looking for you.
+- Blue - chasing you.
+- Violet - stall or bump.
 
 ## Parts
 
