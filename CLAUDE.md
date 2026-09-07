@@ -87,8 +87,11 @@ the tick honours by stopping the motors and skipping the state machine.
   max-minus-mean contrast (`GAZE_K`, `GAZE_DEAD_C`, floor `SPIN_MIN_PCT`)
   so the gaze lingers on warmth. This slow-on-heat sweep is the one piece
   carried over unchanged from the old firmware; it works well, don't
-  fiddle with it. Target centroid within `LOCK_COLS` of boresight
-  (`CENTER_COL`) for `LOCK_TICKS` running = `FOLLOW`.
+  fiddle with it. The spin direction holds for a streak of
+  `SPIN_STREAK_MIN`..`SPIN_STREAK_MAX` scans, then flips: hide behind him
+  and he keeps turning the same way, until he doesn't. Target centroid
+  within `LOCK_COLS` of boresight (`CENTER_COL`) for `LOCK_TICKS` running
+  = `FOLLOW`.
 - `FOLLOW`: drive at `GO_PCT` (100), shedding `STEER_K` of the inner
   wheel's duty per column the centroid sits off boresight. Image columns
   run mirrored to the drive sign (field tested); the sign in the code is

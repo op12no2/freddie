@@ -388,6 +388,10 @@ static void drive(int left_pct, int right_pct)
                                  many ticks running before he goes: one
                                  noisy frame can't launch him */
 #define SPIN_PCT       30     /* scan duty (pre-remap) */
+#define SPIN_STREAK_MIN 3     /* scans one way before he changes his mind:
+                                 hide behind him and he keeps turning the
+                                 same way, until he doesn't */
+#define SPIN_STREAK_MAX 5
 #define SPIN_MIN_PCT   1      /* gaze-drag floor: linger, never stall */
 #define GAZE_K         8.0f   /* duty shed per C of passing warmth */
 #define GAZE_DEAD_C    0.8f   /* scene contrast to ignore (empty-room
@@ -423,7 +427,8 @@ static void drive(int left_pct, int right_pct)
 typedef enum { SCAN, FOLLOW, BACK, TURN } state_t;
 
 static state_t state;
-static int scan_sign;      /* spin direction this scan */
+static int scan_sign;      /* spin direction this scan... */
+static int scan_streak;    /* ...and scans left before it flips */
 static int lost;           /* consecutive ticks without the target */
 static int locking;        /* consecutive ticks with a target near boresight */
 static int stalled;        /* consecutive ticks pushing on something */
@@ -489,7 +494,12 @@ static void enter(state_t s)
     stalled = 0;
     switch (s) {
     case SCAN:
-        scan_sign = (esp_random() & 1) ? 1 : -1;
+        if (scan_streak <= 0) {
+            scan_sign = scan_sign == 1 ? -1 : 1;
+            scan_streak = SPIN_STREAK_MIN +
+                          esp_random() % (SPIN_STREAK_MAX - SPIN_STREAK_MIN + 1);
+        }
+        scan_streak--;
         rgb_set(RGB_GREEN);
         break;
     case FOLLOW:
