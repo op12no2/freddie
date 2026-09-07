@@ -2,11 +2,10 @@
  * INA219 power monitor on one I2C bus, DRV8833 motors, and the DevKit's
  * onboard RGB status LED. Plus an "awake" LED.
  *
- * The whole behaviour: spin one circle on the spot, slowing as warmth
- * crosses the view, then rest half a minute and spin again; when something
- * warm sits near the middle of the frame, drive at it, steering on its
- * centroid, until it fills the frame; sit there while it does; lose it
- * and go back to the circling. Nothing else.
+ * The whole behaviour: spin on the spot, slowing as warmth crosses the
+ * view; when something warm sits near the middle of the frame, chase it,
+ * flat out, steering on its centroid; stand still when it's right at his
+ * wheels; lose it and spin again. A game of tag. Nothing else.
  *
  * A serial console (idf.py monitor, '?' for help) shows the thermal
  * frame for tuning; it's for the bench, not the behaviour. */
@@ -44,7 +43,6 @@
 #define LSM_REG_WHOAMI   0x0F  /* reads 0x6C */
 #define LSM_REG_CTRL1_XL 0x10  /* 0x40 = accel 104 Hz, ±2 g */
 #define LSM_REG_CTRL2_G  0x11  /* 0x44 = gyro 104 Hz, ±500 dps */
-#define LSM_REG_OUTX_L_G 0x22  /* 12 bytes: gyro xyz then accel xyz, LE */
 
 /* Deliberately scrambled vs the DRV8833 pin names: the A channel is
  * soldered to the right motor and B to the left, and both motors have
@@ -65,13 +63,10 @@
 #define RGB_GPIO        38     /* DevKitC-1 v1.1 onboard WS2812; v1.0 boards use 48 */
 
 /* Status colours, dim enough to look at — the LED is blinding at full duty.
- * Red = booting or a check failed, green = scanning (an ember of it
- * between scans), blue = going for something, amber = arrived. */
+ * Red = booting or a check failed, green = scanning, blue = following. */
 #define RGB_RED         32, 0, 0
 #define RGB_GREEN       0, 32, 0
-#define RGB_GREEN_DIM   0, 5, 0
 #define RGB_BLUE        0, 0, 48
-#define RGB_AMBER       48, 24, 0
 
 #define WAKE_LED_GPIO   11     /* discrete orange LED, 1 kOhm to GND, on the
                                   shelf: lit whenever he's running */
@@ -203,22 +198,6 @@ static void lsm_init(void)
         return;
     }
     lsm_ok = true;
-}
-
-/* Gyro in degrees/s and accel in g, both x/y/z. */
-static esp_err_t lsm_read(float dps[3], float g[3])
-{
-    uint8_t reg = LSM_REG_OUTX_L_G;
-    uint8_t raw[12];
-    esp_err_t err = i2c_master_transmit_receive(lsm, &reg, 1, raw, sizeof(raw), 100);
-    if (err != ESP_OK) {
-        return err;
-    }
-    for (int i = 0; i < 3; i++) {
-        dps[i] = (int16_t)(raw[2 * i] | (raw[2 * i + 1] << 8)) * 0.0175f;      /* 17.5 mdps/LSB at ±500 dps */
-        g[i] = (int16_t)(raw[6 + 2 * i] | (raw[7 + 2 * i] << 8)) * 0.000061f;  /* 0.061 mg/LSB at ±2 g */
-    }
-    return ESP_OK;
 }
 
 static rmt_channel_handle_t rgb_chan;
@@ -375,9 +354,6 @@ static void drive(int left_pct, int right_pct)
  * machinery is gone. */
 #define TICK_HZ        10     /* the sensor/behaviour heartbeat */
 #define SPIN_PCT       20     /* scan duty (pre-remap) */
-#define SCAN_TURN_DEG  360.0f /* one gyro-metered circle per scan */
-#define SCAN_TIMEOUT_S 30     /* gyro trouble: don't pirouette forever */
-#define REST_S         30     /* still, between scans */
 #define SPIN_MIN_PCT   1      /* gaze-drag floor: linger, never stall */
 #define GAZE_K         8.0f   /* duty shed per C of passing warmth */
 #define GAZE_DEAD_C    0.8f   /* scene contrast to ignore (empty-room
@@ -389,43 +365,50 @@ static void drive(int left_pct, int right_pct)
 #define CENTER_COL     3.2f   /* boresight column (measured) */
 #define LOCK_COLS      1.0f   /* blob this near boresight during the scan:
                                  go for it */
-#define GO_PCT         30     /* approach duty */
-#define STEER_K        6.0f   /* duty differential per column off boresight */
-#define FILL_PX        32     /* half the frame = arrived. 1 m from a
-                                 crouching child fills 14 px (gestures.log);
-                                 half the frame is right up close */
-#define FILL_HYST_PX   8      /* it must shrink this much below FILL_PX
-                                 before he follows again */
-#define ARRIVED_MAX_S  10     /* then he loses interest and looks around
-                                 again regardless: the one guard against
-                                 sitting forever on something warm the
-                                 reference can't see past */
-#define LOST_TICKS     10     /* a second without the target = gone */
-#define AMBIENT_ALPHA  0.1f   /* ambient tracks the non-target pixels at
-                                 this rate while approaching, so the
-                                 reference is the scene he's looking at
-                                 now, not the one he locked on from */
-#define AMBIENT_MAX_PX 32     /* ...but only while at least half the frame
-                                 is background; a target filling the frame
-                                 can't drag the reference up after itself */
+#define GO_PCT         100    /* follow duty: it's a chase */
+#define STEER_K        25.0f  /* inner-wheel duty shed per column the
+                                 target sits off boresight */
+#define FULL_PX        24     /* the target this big = right at his wheels:
+                                 stand still until it backs off (1 m from a
+                                 crouching child fills 14 px, gestures.log) */
+#define LOST_TICKS     10     /* stand still this long without the target,
+                                 then look around */
 
-typedef enum { SCAN, REST, APPROACH, ARRIVED } state_t;
+typedef enum { SCAN, FOLLOW } state_t;
 
 static state_t state;
 static int scan_sign;      /* spin direction this scan */
-static float scan_yaw;     /* degrees turned this scan */
-static int ticks_left;     /* scan timeout, or rest remaining */
-static float ambient;      /* reference the target is measured against
-                              while approaching: the non-target mean,
-                              frozen whenever the target takes over the
-                              frame — the frame mean can't serve, a target
-                              that fills the frame *is* the mean */
 static int lost;           /* consecutive ticks without the target */
 
-/* For the console: the latest frame and what the behaviour made of it. */
+/* For the console: the latest frame. */
 static float last_t[64];
-static float last_mean;
 static volatile bool frozen;   /* console 'x': sense, but don't move */
+
+static int cmp_float(const void *a, const void *b)
+{
+    float d = *(const float *)a - *(const float *)b;
+    return d < 0 ? -1 : d > 0 ? 1 : 0;
+}
+
+/* The scene minus whoever's in it: the mean of the coldest half of the
+ * frame. Holds up until a target covers half the view, at which point he
+ * can't tell them from the wall anyway — and that's when he loses them
+ * and looks around, which is how the chase ends. Beats the frame mean (a
+ * target that fills the frame *is* the mean) and a reference frozen at
+ * lock-on (stale by the time he's crossed the room). */
+static float ambient_of(const float t[64])
+{
+    float sorted[64];
+    for (int i = 0; i < 64; i++) {
+        sorted[i] = t[i];
+    }
+    qsort(sorted, 64, sizeof(float), cmp_float);
+    float sum = 0;
+    for (int i = 0; i < 32; i++) {
+        sum += sorted[i];
+    }
+    return sum / 32;
+}
 
 /* Blob of pixels BLOB_C over ref: its weight in pixels, and its centroid
  * column when there is one. */
@@ -446,29 +429,6 @@ static int blob(const float t[64], float ref, float *col)
     return n;
 }
 
-/* Mean of the pixels that aren't the blob: the scene minus the visitor. */
-static float ambient_of(const float t[64], float ref)
-{
-    int n = 0;
-    float sum = 0;
-    for (int i = 0; i < 64; i++) {
-        if (t[i] - ref < BLOB_C) {
-            n++;
-            sum += t[i];
-        }
-    }
-    return n > 0 ? sum / n : ref;
-}
-
-/* Keep the ambient honest as he moves: ease it toward the current
- * non-target mean while there's enough background in view to trust. */
-static void ambient_track(const float t[64], int n)
-{
-    if (n <= AMBIENT_MAX_PX) {
-        ambient += AMBIENT_ALPHA * (ambient_of(t, ambient) - ambient);
-    }
-}
-
 static void enter(state_t s)
 {
     state = s;
@@ -476,22 +436,10 @@ static void enter(state_t s)
     switch (s) {
     case SCAN:
         scan_sign = (esp_random() & 1) ? 1 : -1;
-        scan_yaw = 0;
-        ticks_left = SCAN_TIMEOUT_S * TICK_HZ;
         rgb_set(RGB_GREEN);
         break;
-    case REST:
-        drive(0, 0);
-        ticks_left = REST_S * TICK_HZ;
-        rgb_set(RGB_GREEN_DIM);
-        break;
-    case APPROACH:
+    case FOLLOW:
         rgb_set(RGB_BLUE);
-        break;
-    case ARRIVED:
-        drive(0, 0);
-        ticks_left = ARRIVED_MAX_S * TICK_HZ;
-        rgb_set(RGB_AMBER);
         break;
     }
 }
@@ -501,13 +449,7 @@ static int clamp_pct(int pct)
     return pct < 0 ? 0 : pct > 100 ? 100 : pct;
 }
 
-/* A warm blob sitting near boresight: the thing he goes for. */
-static bool locked(const float t[64], float mean, float *col)
-{
-    return blob(t, mean, col) > 0 && fabsf(*col - CENTER_COL) <= LOCK_COLS;
-}
-
-/* One 10 Hz heartbeat: read the camera and gyro, step the behaviour. */
+/* One 10 Hz heartbeat: read the camera, step the behaviour. */
 static void tick_task(void *arg)
 {
     TickType_t wake = xTaskGetTickCount();
@@ -515,26 +457,21 @@ static void tick_task(void *arg)
     while (1) {
         xTaskDelayUntil(&wake, pdMS_TO_TICKS(1000 / TICK_HZ));
         int16_t px[64];
-        float dps[3] = { 0 }, g[3];
         if (amg_read_pixels(px) != ESP_OK) {
             drive(0, 0);   /* blind: don't move */
             continue;
         }
-        lsm_read(dps, g);   /* a failed read counts no yaw; the scan
-                               timeout covers it */
         float t[64], maxt = -100, sum = 0, col = CENTER_COL;
         for (int i = 0; i < 64; i++) {
             t[i] = px[i] * 0.25f;
+            last_t[i] = t[i];
             sum += t[i];
             if (t[i] > maxt) {
                 maxt = t[i];
             }
         }
         float mean = sum / 64;
-        for (int i = 0; i < 64; i++) {
-            last_t[i] = t[i];
-        }
-        last_mean = mean;
+        int n = blob(t, ambient_of(t), &col);
         if (frozen) {
             drive(0, 0);
             continue;
@@ -552,67 +489,30 @@ static void tick_task(void *arg)
                 duty = SPIN_MIN_PCT;
             }
             drive(scan_sign * duty, -scan_sign * duty);
-            if (locked(t, mean, &col)) {
-                ambient = ambient_of(t, mean);
-                enter(APPROACH);
-                break;
-            }
-            scan_yaw += dps[2] * (1.0f / TICK_HZ);
-            if (fabsf(scan_yaw) >= SCAN_TURN_DEG || --ticks_left <= 0) {
-                enter(REST);   /* circle done, nothing doing */
+            if (n > 0 && fabsf(col - CENTER_COL) <= LOCK_COLS) {
+                enter(FOLLOW);
             }
             break;
         }
-        case REST: {
-            /* still, but not blind: something warm walking up to him
-             * mid-rest gets the same welcome as it would mid-scan */
-            if (locked(t, mean, &col)) {
-                ambient = ambient_of(t, mean);
-                enter(APPROACH);
-                break;
-            }
-            if (--ticks_left <= 0) {
-                enter(SCAN);
-            }
-            break;
-        }
-        case APPROACH: {
-            int n = blob(t, ambient, &col);
-            ambient_track(t, n);
+        case FOLLOW: {
             if (n == 0) {
+                drive(0, 0);   /* don't charge blind at full duty */
                 if (++lost >= LOST_TICKS) {
                     enter(SCAN);
                 }
-                break;   /* a dropped frame: hold course */
+                break;
             }
             lost = 0;
-            if (n >= FILL_PX) {
-                enter(ARRIVED);
+            if (n >= FULL_PX) {
+                drive(0, 0);   /* caught up: wait for them to move */
                 break;
             }
             /* sign field-tested: image columns run mirrored, so a
              * centroid right of boresight means the target is to his
-             * left — slow the left wheel */
-            float off = col - CENTER_COL;
-            drive(clamp_pct(GO_PCT - (int)(STEER_K * off)),
-                  clamp_pct(GO_PCT + (int)(STEER_K * off)));
-            break;
-        }
-        case ARRIVED: {
-            int n = blob(t, ambient, &col);
-            ambient_track(t, n);
-            if (n == 0) {
-                if (++lost >= LOST_TICKS) {
-                    enter(SCAN);
-                }
-                break;
-            }
-            lost = 0;
-            if (n < FILL_PX - FILL_HYST_PX) {
-                enter(APPROACH);   /* they stepped back: follow */
-            } else if (--ticks_left <= 0) {
-                enter(SCAN);       /* that'll do: what else is about? */
-            }
+             * left — shed the left wheel */
+            int turn = (int)(STEER_K * (col - CENTER_COL));
+            drive(clamp_pct(GO_PCT - (turn > 0 ? turn : 0)),
+                  clamp_pct(GO_PCT + (turn < 0 ? turn : 0)));
             break;
         }
         }
@@ -623,36 +523,22 @@ static const char *state_name(void)
 {
     switch (state) {
     case SCAN: return "scan";
-    case REST: return "rest";
-    case APPROACH: return "approach";
-    case ARRIVED: return "arrived";
+    case FOLLOW: return "follow";
     }
     return "?";
 }
 
 /* The frame as the sensor delivers it: row 0 first, column 0 first.
- * Pixels the behaviour counts as the target are starred, against the
- * reference the current state uses. */
+ * Pixels the behaviour counts as the target are starred. */
 static void print_frame(void)
 {
     float t[64];
     for (int i = 0; i < 64; i++) {
         t[i] = last_t[i];
     }
-    float mean = last_mean;
-    float ref = (state == APPROACH || state == ARRIVED) ? ambient : mean;
+    float ref = ambient_of(t);
     float col = 0;
     int n = blob(t, ref, &col);
-    int rsum = 0, lo = -1, hi = -1;
-    for (int i = 0; i < 64; i++) {
-        if (t[i] - ref >= BLOB_C) {
-            rsum += i / 8;
-            if (lo < 0) {
-                lo = i / 8;
-            }
-            hi = i / 8;
-        }
-    }
     printf("      ");
     for (int c = 0; c < 8; c++) {
         printf("   c%d ", c);
@@ -666,13 +552,11 @@ static void print_frame(void)
         }
         printf("\n");
     }
-    printf("  %s%s  mean %.2f  ref %.2f (%s)  blob %d px",
-           state_name(), frozen ? " (frozen)" : "", mean, ref,
-           ref == mean ? "frame mean" : "tracked ambient", n);
+    printf("  %s%s  ambient %.2f  blob %d px", state_name(),
+           frozen ? " (frozen)" : "", ref, n);
     if (n > 0) {
-        printf("  col %.2f (off %+.2f)  rows %d..%d (centroid %.2f)%s",
-               col, col - CENTER_COL, lo, hi, (float)rsum / n,
-               n >= FILL_PX ? "  FULL" : "");
+        printf("  col %.2f (off %+.2f)%s", col, col - CENTER_COL,
+               n >= FULL_PX ? "  FULL" : "");
     }
     printf("\n");
 }
