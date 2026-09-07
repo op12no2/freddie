@@ -88,10 +88,15 @@ stopping the motors and skipping the state machine.
   centroid sits off boresight. The blob is measured against the frozen
   `ambient`, not the live frame mean, because a target that fills the
   frame *is* the mean. Image columns run mirrored to the drive sign (field
-  tested); the sign in the code is right. Blob weight reaching `FILL_PX`
-  = `ARRIVED`; no blob for `LOST_TICKS` = back to `SCAN`.
-- `ARRIVED`: motors off. Blob shrinking below `FILL_PX - FILL_HYST_PX` =
-  follow (`APPROACH`); gone for `LOST_TICKS` = `SCAN`.
+  tested); the sign in the code is right. `arrived()` = the blob's nearest
+  row has reached the floor line (`FLOOR_ROW`, row 0: the bottom of the
+  frame, which a warm thing on the floor reaches at ~10 cm regardless of
+  its size — the one distance cue the sensor offers) or its weight has hit
+  `FILL_PX` (backstop for warmth held off the floor). No blob for
+  `LOST_TICKS` = back to `SCAN`.
+- `ARRIVED`: motors off. `receded()` = clear of the floor line by
+  `FLOOR_HYST_ROWS` and under `FILL_PX - FILL_HYST_PX` = follow
+  (`APPROACH`); gone for `LOST_TICKS` = `SCAN`.
 
 Thresholds carry comments citing measured logs (`gestures.log`,
 `quiet_room_sat.log`, cal runs) from the old firmware; the numbers are

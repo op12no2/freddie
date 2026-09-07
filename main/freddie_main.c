@@ -391,9 +391,20 @@ static void drive(int left_pct, int right_pct)
                                  go for it */
 #define GO_PCT         30     /* approach duty */
 #define STEER_K        6.0f   /* duty differential per column off boresight */
-#define FILL_PX        32     /* half the frame = arrived. 1 m from a
-                                 crouching child fills 14 px (gestures.log);
-                                 half the frame is right up close */
+#define FLOOR_ROW      0      /* the floor line: the frame's bottom row is
+                                 row 0 (rows run mirrored like the
+                                 columns), and a warm thing on the floor
+                                 reaches it at ~10 cm (measured with the
+                                 console). Feet, a crouching child, a
+                                 standing adult all arrive here at the
+                                 same distance, whatever their size */
+#define FLOOR_HYST_ROWS 1     /* the blob must lift this many rows clear of
+                                 the floor line before he follows again */
+#define FILL_PX        32     /* backstop for warmth held off the floor
+                                 (a hand): half the frame = arrived. 1 m
+                                 from a crouching child fills 14 px
+                                 (gestures.log); half the frame is right
+                                 up close */
 #define FILL_HYST_PX   8      /* it must shrink this much below FILL_PX
                                  before he follows again */
 #define LOST_TICKS     10     /* a second without the target = gone */
@@ -415,23 +426,43 @@ static float last_t[64];
 static float last_mean;
 static volatile bool frozen;   /* console 'x': sense, but don't move */
 
-/* Blob of pixels BLOB_C over ref: its weight in pixels, and its centroid
- * column when there is one. */
-static int blob(const float t[64], float ref, float *col)
+/* Blob of pixels BLOB_C over ref: its weight in pixels, and when there is
+ * one its centroid column and its nearest row (the lowest row index, row
+ * 0 being the floor line). */
+static int blob(const float t[64], float ref, float *col, int *near)
 {
-    int n = 0;
+    int n = 0, nearest = 8;
     float csum = 0;
     for (int i = 0; i < 64; i++) {
         if (t[i] - ref >= BLOB_C) {
             n++;
             csum += i % 8;
+            if (i / 8 < nearest) {
+                nearest = i / 8;
+            }
         }
     }
     if (n < BLOB_MIN_PX) {
         return 0;
     }
     *col = csum / n;
+    if (near) {
+        *near = nearest;
+    }
     return n;
+}
+
+/* Arrived: the blob has reached the floor line, or fills the frame. */
+static bool arrived(int n, int near)
+{
+    return near <= FLOOR_ROW || n >= FILL_PX;
+}
+
+/* Worth following again: clear of the floor line by a margin, and well
+ * short of filling the frame. */
+static bool receded(int n, int near)
+{
+    return near > FLOOR_ROW + FLOOR_HYST_ROWS && n < FILL_PX - FILL_HYST_PX;
 }
 
 /* Mean of the pixels that aren't the blob: the scene minus the visitor. */
@@ -482,7 +513,7 @@ static int clamp_pct(int pct)
 /* A warm blob sitting near boresight: the thing he goes for. */
 static bool locked(const float t[64], float mean, float *col)
 {
-    return blob(t, mean, col) > 0 && fabsf(*col - CENTER_COL) <= LOCK_COLS;
+    return blob(t, mean, col, NULL) > 0 && fabsf(*col - CENTER_COL) <= LOCK_COLS;
 }
 
 /* One 10 Hz heartbeat: read the camera and gyro, step the behaviour. */
@@ -555,7 +586,8 @@ static void tick_task(void *arg)
             break;
         }
         case APPROACH: {
-            int n = blob(t, ambient, &col);
+            int near;
+            int n = blob(t, ambient, &col, &near);
             if (n == 0) {
                 if (++lost >= LOST_TICKS) {
                     enter(SCAN);
@@ -563,7 +595,7 @@ static void tick_task(void *arg)
                 break;   /* a dropped frame: hold course */
             }
             lost = 0;
-            if (n >= FILL_PX) {
+            if (arrived(n, near)) {
                 enter(ARRIVED);
                 break;
             }
@@ -576,7 +608,8 @@ static void tick_task(void *arg)
             break;
         }
         case ARRIVED: {
-            int n = blob(t, ambient, &col);
+            int near;
+            int n = blob(t, ambient, &col, &near);
             if (n == 0) {
                 if (++lost >= LOST_TICKS) {
                     enter(SCAN);
@@ -584,7 +617,7 @@ static void tick_task(void *arg)
                 break;
             }
             lost = 0;
-            if (n < FILL_PX - FILL_HYST_PX) {
+            if (receded(n, near)) {
                 enter(APPROACH);   /* they stepped back: follow */
             }
             break;
@@ -616,15 +649,13 @@ static void print_frame(void)
     float mean = last_mean;
     float ref = (state == APPROACH || state == ARRIVED) ? ambient : mean;
     float col = 0;
-    int n = blob(t, ref, &col);
-    int rsum = 0, lowest = -1, highest = -1;
+    int near = 8;
+    int n = blob(t, ref, &col, &near);
+    int rsum = 0, far = -1;
     for (int i = 0; i < 64; i++) {
         if (t[i] - ref >= BLOB_C) {
             rsum += i / 8;
-            if (highest < 0) {
-                highest = i / 8;
-            }
-            lowest = i / 8;
+            far = i / 8;
         }
     }
     printf("      ");
@@ -644,8 +675,9 @@ static void print_frame(void)
            state_name(), frozen ? " (frozen)" : "", mean, ref,
            ref == mean ? "frame mean" : "frozen ambient", n);
     if (n > 0) {
-        printf("  col %.2f (off %+.2f)  rows %d..%d (centroid %.2f)",
-               col, col - CENTER_COL, highest, lowest, (float)rsum / n);
+        printf("  col %.2f (off %+.2f)  rows %d..%d (centroid %.2f)%s",
+               col, col - CENTER_COL, near, far, (float)rsum / n,
+               arrived(n, near) ? "  ARRIVED" : "");
     }
     printf("\n");
 }
