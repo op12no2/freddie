@@ -85,9 +85,11 @@ the tick honours by stopping the motors and skipping the state machine.
   time he'd crossed the room. Both are in git history.)
 - `SCAN`: spin at `SPIN_PCT`, flat. (The old firmware's sweep slowed as
   warmth crossed the view, a lovely lingering gaze; it's in git history,
-  dropped because the game wants frantic.) The spin direction holds for a streak of
-  `SPIN_STREAK_MIN`..`SPIN_STREAK_MAX` scans, then flips: hide behind him
-  and he keeps turning the same way, until he doesn't. Target centroid
+  dropped because the game wants frantic.) A scan starts toward the side the
+  target was last seen heading (`scan_hint`, set every `FOLLOW` tick from
+  the centroid's side, cleared by a tag), so a lost target is usually a
+  short turn away; one scan in every `SPIN_STREAK_MIN`..`SPIN_STREAK_MAX`
+  goes the other way instead, to catch out whoever's hiding behind him. Target centroid
   within `LOCK_COLS` of boresight (`CENTER_COL`) for `LOCK_TICKS` running
   = `FOLLOW`.
 - `FOLLOW`: drive at `GO_PCT` (100), shedding `STEER_K` of the inner

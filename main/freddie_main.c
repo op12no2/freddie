@@ -388,9 +388,11 @@ static void drive(int left_pct, int right_pct)
                                  many ticks running before he goes: one
                                  noisy frame can't launch him */
 #define SPIN_PCT       30     /* scan duty (pre-remap) */
-#define SPIN_STREAK_MIN 3     /* scans one way before he changes his mind:
-                                 hide behind him and he keeps turning the
-                                 same way, until he doesn't */
+#define SPIN_STREAK_MIN 3     /* a scan normally starts toward the side he
+                                 last saw the target go; one scan in every
+                                 this-many..that-many goes the other way
+                                 instead, to catch out whoever's hiding
+                                 behind him */
 #define SPIN_STREAK_MAX 5
 #define BLOB_C         2.0f   /* px over ambient = part of the target: a
                                  standing person at 2 m clears the frame
@@ -423,8 +425,10 @@ static void drive(int left_pct, int right_pct)
 typedef enum { SCAN, FOLLOW, BACK, TURN } state_t;
 
 static state_t state;
-static int scan_sign;      /* spin direction this scan... */
-static int scan_streak;    /* ...and scans left before it flips */
+static int scan_sign;      /* spin direction this scan */
+static int scan_streak;    /* scans until the next contrary one */
+static int scan_hint;      /* which way the target last went, as a spin
+                              sign; 0 = no idea */
 static int lost;           /* consecutive ticks without the target */
 static int locking;        /* consecutive ticks with a target near boresight */
 static int stalled;        /* consecutive ticks pushing on something */
@@ -490,10 +494,16 @@ static void enter(state_t s)
     stalled = 0;
     switch (s) {
     case SCAN:
+        if (scan_hint) {
+            scan_sign = scan_hint;   /* after them, the short way round */
+        }
         if (scan_streak <= 0) {
-            scan_sign = scan_sign == 1 ? -1 : 1;
+            scan_sign = -scan_sign;  /* ...except now and then: gotcha */
             scan_streak = SPIN_STREAK_MIN +
                           esp_random() % (SPIN_STREAK_MAX - SPIN_STREAK_MIN + 1);
+        }
+        if (scan_sign == 0) {
+            scan_sign = (esp_random() & 1) ? 1 : -1;   /* the first scan */
         }
         scan_streak--;
         rgb_set(RGB_GREEN);
@@ -502,6 +512,7 @@ static void enter(state_t s)
         rgb_set(RGB_BLUE);
         break;
     case BACK:
+        scan_hint = 0;   /* tagged: turning away, not after them */
         ticks_left = BACK_MS * TICK_HZ / 1000;
         drive(-BACK_PCT, -BACK_PCT);
         rgb_set(RGB_TAG);
@@ -580,8 +591,11 @@ static void tick_task(void *arg)
             lost = 0;
             /* sign field-tested: image columns run mirrored, so a
              * centroid right of boresight means the target is to his
-             * left — shed the left wheel */
-            int turn = (int)(STEER_K * (col - CENTER_COL));
+             * left — shed the left wheel, and if they vanish, spin
+             * left to find them (spin sign +1 turns him right) */
+            float off = col - CENTER_COL;
+            scan_hint = off > 0 ? -1 : 1;
+            int turn = (int)(STEER_K * off);
             drive(clamp_pct(GO_PCT - (turn > 0 ? turn : 0)),
                   clamp_pct(GO_PCT + (turn < 0 ? turn : 0)));
             break;
