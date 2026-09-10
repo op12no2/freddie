@@ -1,6 +1,7 @@
 /* firmware: Freddie the robot. AMG8833 thermal camera, LSM6DSOX IMU and
- * INA219 power monitor on one I2C bus, DRV8833 motors, and the DevKit's
- * onboard RGB status LED, and a discrete "running" LED on the shelf.
+ * (optionally) an INA219 power monitor on one I2C bus, DRV8833 motors,
+ * the DevKit's onboard RGB status LED, and (optionally) a discrete
+ * "running" LED on the shelf.
  *
  * The whole behaviour: spin on the spot; when something warm sits near
  * the middle of the frame, chase it
@@ -36,7 +37,7 @@
 #define AMG_REG_INTC    0x03   /* interrupt control: 0x00 = disabled */
 #define AMG_REG_PIXELS  0x80   /* 64 pixels x 2 bytes, little-endian */
 
-#define INA_I2C_ADDR    0x40
+#define INA_I2C_ADDR    0x40   /* per-build INA_FITTED says if it's there */
 #define INA_REG_CONFIG  0x00   /* 0x399F = 32 V range, ±320 mV PGA, 12-bit */
 #define INA_REG_SHUNT   0x01   /* signed, 10 uV per LSB across the 0.1R shunt */
 #define INA_REG_BUS     0x02   /* bits 15..3, 4 mV per LSB */
@@ -47,21 +48,90 @@
 #define LSM_REG_CTRL2_G  0x11  /* 0x44 = gyro 104 Hz, ±500 dps */
 #define LSM_REG_OUTX_L_G 0x22  /* 12 bytes: gyro xyz then accel xyz, LE */
 
-/* Deliberately scrambled vs the DRV8833 pin names: the A channel is
- * soldered to the right motor and B to the left, and both motors have
- * inverted polarity, so we un-cross and un-invert them here. */
+/* ======================================================================
+ * PER-BUILD HARDWARE. There is more than one Freddie, and they differ in
+ * motors and fit-out. Everything that varies between them lives in this
+ * block, selected at build time by FREDDIE_BUILD (see main/CMakeLists.txt
+ * and README.md: idf.py -DFREDDIE_BUILD=N). Adding a robot = adding an
+ * #elif with its own copy of these defines. Nothing outside this block
+ * should ever need to know which Freddie it is.
+ *
+ * What each build sets, and how to find the values for a new one:
+ *
+ * 1. Motor wiring. The GPIO pairs are deliberately scrambled vs the
+ *    DRV8833's own pin names: on build 1 the A channel is soldered to
+ *    the right motor and B to the left, and both motors run with
+ *    inverted polarity, so the crossing and the inversion are undone
+ *    once, here, and drive(left, right) downstream is sane. Don't "fix"
+ *    the apparent crossing in the code; fix it in these macros. On a new
+ *    build: if a wheel runs backwards, swap that wheel's IN1 and IN2
+ *    GPIOs; if left and right are swapped, swap the L and R pairs.
+ *    Forward = drive(+, +) = both wheels roll him forward.
+ * 2. Deadband (MOTOR_MIN_PCT). Below it the wheels stall-or-creep at
+ *    random. Measure: drive both wheels at rising duty from rest and
+ *    note the lowest that reliably moves him.
+ * 3. Trim (DRIVE_TRIM_PCT). No two TT motors are matched. Measure: drive
+ *    straight open loop and adjust until he tracks straight.
+ * 4. INA_FITTED: whether there's an INA219 on the pack. Without one
+ *    there's no stall detection (bumps still tag) and no USB-only motor
+ *    lockout in pack_live(), so don't run that build's motors on USB
+ *    with the pack off.
+ * 5. RUN_LED_GPIO: the discrete "running" LED on the shelf, or -1 if
+ *    there isn't one.
+ *
+ * Not in this block but sensitive to the motor's speed and torque, so
+ * worth a look if a build's motor is much faster or slower: the duties
+ * SPIN_PCT (a faster motor spins past the lock window before LOCK_TICKS
+ * elapse), GO_PCT, STEER_K, BACK_PCT/BACK_MS and TURN_PCT, and the stall
+ * floor STALL_MIN_MA (a lower-torque motor stalls at less current).
+ * ====================================================================== */
+
+#ifndef FREDDIE_BUILD
+#error "FREDDIE_BUILD is not set: build with idf.py -DFREDDIE_BUILD=N (see README.md)"
+#endif
+
+#if FREDDIE_BUILD == 1
+/* Build 1: the original. 1:90 bi-metal TT motors, INA219 on the pack,
+ * orange LED on the shelf. */
 #define MOTOR_L_IN1_GPIO  7    /* DRV8833 BIN2 */
 #define MOTOR_L_IN2_GPIO  6    /* DRV8833 BIN1 */
 #define MOTOR_R_IN1_GPIO  5    /* DRV8833 AIN2 */
 #define MOTOR_R_IN2_GPIO  4    /* DRV8833 AIN1 */
-#define DRV_SLP_GPIO      10   /* DRV8833 nSLEEP: high = enabled */
+#define MOTOR_MIN_PCT   25     /* deadband: measured (cal 20260804133108) no
+                                  motion at 20, reliable from rest at 25 */
+#define DRIVE_TRIM_PCT  -1     /* measured: actual duties 49/50 drive straight */
+#define INA_FITTED      1
+#define RUN_LED_GPIO    11     /* discrete orange LED, 1 kOhm to GND */
 
+#elif FREDDIE_BUILD == 2
+/* Build 2: 1:48 plastic TT motors (200 rpm, about twice build 1's speed
+ * and less torque), no INA219, no shelf LED. The wiring and calibration
+ * are COPIED FROM BUILD 1 AND NOT YET MEASURED: check the wheel
+ * directions, then the deadband, then the trim, per the notes above. */
+#define MOTOR_L_IN1_GPIO  7    /* DRV8833 BIN2 */
+#define MOTOR_L_IN2_GPIO  6    /* DRV8833 BIN1 */
+#define MOTOR_R_IN1_GPIO  5    /* DRV8833 AIN2 */
+#define MOTOR_R_IN2_GPIO  4    /* DRV8833 AIN1 */
+#define MOTOR_MIN_PCT   25     /* unmeasured: build 1's value */
+#define DRIVE_TRIM_PCT  0      /* unmeasured */
+#define INA_FITTED      0
+#define RUN_LED_GPIO    -1
+
+#else
+#error "FREDDIE_BUILD: no such build (see the PER-BUILD HARDWARE block)"
+#endif
+
+/* Common to every build. */
+#define DRV_SLP_GPIO    10     /* DRV8833 nSLEEP: high = enabled */
 #define PWM_FREQ_HZ     25000  /* above audible, well under DRV8833's max */
-#define MOTOR_MIN_PCT   25     /* measured deadband (cal 20260804133108): no
-                                  motion at 20, reliable from rest at 25;
-                                  below it wheels stall-or-creep at random */
 #define PWM_RES         LEDC_TIMER_10_BIT
 #define PWM_MAX         (1 << 10)   /* LEDC duty range is [0, 2^res] */
+#define MOTOR_L_IN1_CH  LEDC_CHANNEL_0
+#define MOTOR_L_IN2_CH  LEDC_CHANNEL_1
+#define MOTOR_R_IN1_CH  LEDC_CHANNEL_2
+#define MOTOR_R_IN2_CH  LEDC_CHANNEL_3
+
+/* ========================================== end of PER-BUILD HARDWARE. */
 
 #define RGB_GPIO        38     /* DevKitC-1 v1.1 onboard WS2812; v1.0 boards use 48 */
 
@@ -73,13 +143,7 @@
 #define RGB_BLUE        0, 0, 48
 #define RGB_TAG         48, 0, 48
 
-#define RUN_LED_GPIO    11     /* discrete orange LED, 1 kOhm to GND, on the
-                                  shelf: lit whenever he's running */
-
-#define MOTOR_L_IN1_CH  LEDC_CHANNEL_0
-#define MOTOR_L_IN2_CH  LEDC_CHANNEL_1
-#define MOTOR_R_IN1_CH  LEDC_CHANNEL_2
-#define MOTOR_R_IN2_CH  LEDC_CHANNEL_3
+/* RUN_LED_GPIO, the discrete "running" LED on the shelf, is per-build. */
 
 static i2c_master_dev_handle_t amg, ina, lsm;
 static bool amg_ok, ina_ok, lsm_ok;
@@ -166,6 +230,9 @@ static esp_err_t ina_read_reg(uint8_t reg, uint16_t *val)
 
 static void ina_init(void)
 {
+    if (!INA_FITTED) {
+        return;
+    }
     ina = i2c_add(INA_I2C_ADDR);
     uint8_t cfg[3] = { INA_REG_CONFIG, 0x39, 0x9F };
     if (i2c_master_transmit(ina, cfg, sizeof(cfg), 100) != ESP_OK) {
@@ -245,12 +312,21 @@ static void rgb_init(void)
     ESP_ERROR_CHECK(rmt_new_bytes_encoder(&enc_cfg, &rgb_enc));
     ESP_ERROR_CHECK(rmt_enable(rgb_chan));
 
+#if RUN_LED_GPIO >= 0
     gpio_config_t run_cfg = {
         .pin_bit_mask = 1ULL << RUN_LED_GPIO,
         .mode = GPIO_MODE_OUTPUT,
     };
     ESP_ERROR_CHECK(gpio_config(&run_cfg));
     gpio_set_level(RUN_LED_GPIO, 0);   /* dark until the checks pass */
+#endif
+}
+
+static void run_led_set(bool on)
+{
+#if RUN_LED_GPIO >= 0
+    gpio_set_level(RUN_LED_GPIO, on);
+#endif
 }
 
 static void rgb_set(uint8_t r, uint8_t g, uint8_t b)
@@ -342,7 +418,8 @@ static bool pack_ok;
  * carries nothing — running motors then would pull amps through that
  * diode (see schematic). The pack covers the ESP32's idle draw
  * whenever it's on (measured 43-59 mA untethered, ~0 on USB), so a
- * near-zero shunt reading means USB only. */
+ * near-zero shunt reading means USB only. Without an INA219 there's no
+ * way to tell, and the motors run regardless. */
 static bool pack_live(void)
 {
     if (!pack_ok) {
@@ -350,12 +427,6 @@ static bool pack_live(void)
     }
     return pack_ma > 20.0f;
 }
-
-/* No two TT motors are matched: the trim is added to the left duty
- * (sign-aware, so it corrects magnitude in reverse too) whenever both
- * wheels are driven. Set by open-loop test. Measured: actual duties
- * 49/50 drive straight. */
-#define DRIVE_TRIM_PCT  -1
 
 static int cmd_left, cmd_right;   /* commanded duties, so the stall check
                                      knows when he's meant to be moving */
@@ -594,7 +665,8 @@ static void tick_task(void *arg)
         case FOLLOW: {
             /* tag, two ways: commanded moving but the pack says he's
              * pushing on something (feet, usually), or the accelerometer
-             * says he just hit something */
+             * says he just hit something. No INA219 fitted = no pack
+             * reading = never pushing; bumps alone tag then. */
             bool commanded = cmd_left != 0 || cmd_right != 0;
             moving = commanded ? moving + 1 : 0;
             float accel = sqrtf(g[0] * g[0] + g[1] * g[1]);
@@ -701,9 +773,12 @@ static void print_frame(void)
     if (n > 0) {
         printf("  col %.2f (off %+.2f)", col, col - CENTER_COL);
     }
-    printf("\n  pack %.2f V %.0f mA (avg %.0f)  motors %d/%d  "
-           "accel %.2f g (avg %.2f)\n",
-           pack_v, pack_ma, ma_avg, cmd_left, cmd_right,
+    if (pack_ok) {
+        printf("\n  pack %.2f V %.0f mA (avg %.0f)", pack_v, pack_ma, ma_avg);
+    } else {
+        printf("\n  pack --");
+    }
+    printf("  motors %d/%d  accel %.2f g (avg %.2f)\n", cmd_left, cmd_right,
            sqrtf(last_g[0] * last_g[0] + last_g[1] * last_g[1]), accel_avg);
 }
 
@@ -761,11 +836,13 @@ void app_main(void)
     ina_init();
     lsm_init();
 
-    /* Failed checks: stay red and still. */
-    printf("startup: amg %s, ina %s, lsm %s\n", amg_ok ? "ok" : "MISSING",
-           ina_ok ? "ok" : "MISSING", lsm_ok ? "ok" : "MISSING");
-    if (amg_ok && ina_ok && lsm_ok) {
-        gpio_set_level(RUN_LED_GPIO, 1);
+    /* Failed checks: stay red and still. The INA219 only counts on builds
+     * that have one. */
+    printf("freddie build %d: amg %s, lsm %s, ina %s\n", FREDDIE_BUILD,
+           amg_ok ? "ok" : "MISSING", lsm_ok ? "ok" : "MISSING",
+           INA_FITTED ? (ina_ok ? "ok" : "MISSING") : "not fitted");
+    if (amg_ok && lsm_ok && (ina_ok || !INA_FITTED)) {
+        run_led_set(true);
         rgb_set(RGB_GREEN);   /* checks passed; still while the camera settles */
         xTaskCreate(tick_task, "tick", 4096, NULL, 5, NULL);
     }

@@ -43,6 +43,14 @@ idf.py -p /dev/ttyUSB0 flash
 There's no flashing script or CI — build/flash via `idf.py` is the whole
 workflow.
 
+There is more than one physical Freddie. `FREDDIE_BUILD` (a CMake
+variable, default 1, passed as `idf.py -B build-N -DFREDDIE_BUILD=N build`;
+it sticks in that build directory's cache) selects the "PER-BUILD
+HARDWARE" block near the top of `freddie_main.c`: motor GPIO wiring,
+motor deadband and trim, `INA_FITTED`, and `RUN_LED_GPIO` (-1 = none).
+Nothing outside that block may depend on the build number. README.md has
+the table of builds and the commands.
+
 ## Architecture
 
 **Target**: ESP32-S3 (`sdkconfig.defaults`), 8 MB flash.
@@ -54,7 +62,8 @@ workflow.
   sensor (a stall reads as a push) and backs `pack_live()`, which refuses
   to drive the motors on USB power alone; the accelerometer is the other
   (a jolt reads as a hit); the gyro Z axis meters the turn-away after a
-  tag.
+  tag. The INA219 is per-build (`INA_FITTED`): a build without one plays
+  with no stall detection (bumps still tag) and no USB-only motor lockout.
 - DRV8833 dual motor driver via LEDC PWM (`motors_init`, `motor_set`,
   `drive`). Note the wiring is physically crossed and inverted versus the
   DRV8833's own pin names — this is corrected once in the `MOTOR_*_GPIO`
@@ -63,13 +72,14 @@ workflow.
 - Onboard WS2812 RGB status LED via RMT (`rgb_init`/`rgb_set`). Colour
   meanings are the `RGB_*` macros: red = booting/failed check, green =
   scanning, blue = following, violet = tagged.
-- A discrete GPIO LED (`RUN_LED_GPIO`) is lit whenever the checks passed
-  and he's running.
+- A discrete GPIO LED (`RUN_LED_GPIO`, per-build, -1 = not fitted) is lit
+  whenever the checks passed and he's running.
 
 **Concurrency model**: one FreeRTOS task, `tick_task`, at `TICK_HZ`
 (10 Hz). Each tick it reads the pack, the IMU and the thermal frame and
 steps a four-state machine (`state_t`: `SCAN`, `FOLLOW`, `BACK`, `TURN`). `app_main()` initialises the
-peripherals, starts the task if every check passed, then runs the console
+peripherals, starts the task if every fitted sensor's check passed, then
+runs the console
 loop on UART0 forever. The task holds still for `SETTLE_S` before its
 first scan: the AMG8833's first frames after reset are junk and once
 locked him onto a wall. The tick task publishes its latest frame (`last_t`)
